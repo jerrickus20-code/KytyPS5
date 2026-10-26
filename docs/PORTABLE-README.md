@@ -373,12 +373,15 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 ### Late DLSS and the cheat keys (`run-latedlss-1440-cheats.cmd`)
 
 `run-latedlss-1440-cheats.cmd` renders the 3D at 1280x720, skips the game's TAA, runs the game's post-processing at 720
-and then upscales the finished picture to 2560x1440 with one DLSS pass, before the HUD is laid over it. It needs DLSS
-frame generation (NVIDIA's Streamline runtime). Shift+F6 compares it with the game's own TAA and stretch.
+and then upscales the finished picture to 2560x1440 with one DLSS pass, before the HUD is laid over it. The game's
+output is then 2560x1440 too (its HD mode at that size, the HUD in its 4K layout drawn at 1440): DLSS's picture is shown
+as it is, not stretched to a 4K output and scaled down to the screen again, and the game draws no 4K frame. It needs
+DLSS frame generation (NVIDIA's Streamline runtime). Shift+F6 compares it with the game's own TAA and stretch.
 
 | Switch | What it does |
 | --- | --- |
-| `KYTY_LATE_DLSS=<height>` | DLSS super resolution of the finished picture to `<height>` lines (720-2160), in place of the game's stretch |
+| `KYTY_LATE_DLSS=<height>` | DLSS super resolution of the finished picture to `<height>` lines (720-2160), in place of the game's stretch; from 1080 to 2159 the game's output is that size too (without `KYTY_RENDER_HEIGHT` the render height is half of it) |
+| `KYTY_LATE_DLSS_OUTPUT=4k` | Keeps the game's 4K output with late DLSS (the picture stretched to 4K and scaled down to the screen, as before) |
 | `KYTY_LATE_DLSS_AA=1` | The game's TAA is not run; DLSS anti-aliases the jittered picture as well |
 | `KYTY_LATE_DLSS_HDR=1` | The picture handed to DLSS is HDR (default: SDR) |
 | `KYTY_DLSS_PRESET=<A-O>` | The DLSS preset (e.g. `M`, `K`) |
@@ -387,7 +390,9 @@ frame generation (NVIDIA's Streamline runtime). Shift+F6 compares it with the ga
 | `KYTY_CHEAT_GIVE_SLOT=<hex>` | The cheat file's empty 16-byte slot (`1E78A70` in 01.007.000): F10's panel gives items through it |
 | `KYTY_CHEAT_ITEMS=<file>` | The give panel's item list; `KYTY_CHEAT_GIVE_FILE=<file>`: the items its "Give give.txt" button gives |
 
-The cheat files go in a `cheats` folder next to the launcher (it runs without them).
+The cheat files go in a `cheats` folder next to the launcher (it runs without them). The script passes its own `-Set`
+list, so another switch is set in the console before it: `set KYTY_LATE_DLSS_OUTPUT=4k`, then
+`run-latedlss-1440-cheats.cmd` (the emulator gets the console's environment).
 
 ### Your own keys
 

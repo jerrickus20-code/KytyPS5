@@ -1,7 +1,9 @@
 @echo off
 rem Late DLSS: the game renders its 3D at 1280x720, its TAA is skipped (the picture kept jittered), its bloom, depth of
 rem field and the rest run at 720, then one DLSS super resolution pass anti-aliases and upscales that finished picture to
-rem 2560x1440 before the HUD is laid over it (KYTY_LATE_DLSS, src/local/frame-gen.h). Needs DLSS frame generation
+rem 2560x1440 before the HUD is laid over it (KYTY_LATE_DLSS, src/local/frame-gen.h); the game's output is 2560x1440 too
+rem (loader/demonsSoulsHdOutput.h; "set KYTY_LATE_DLSS_OUTPUT=4k" in the console first: its 4K output; other switches
+rem the same way, this file's -Set list taking -Set). Needs DLSS frame generation
 rem (NVIDIA's Streamline runtime, -StreamlineDir or a "streamline" folder next to the emulator).
 rem
 rem In game: Shift+F6 late DLSS on/off (off: the game's own TAA and stretch, to compare), F4 the 30 fps cap (60 shown with

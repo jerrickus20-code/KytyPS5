@@ -2,15 +2,19 @@
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSuperResolution.h"
 
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "loader/guestCode.h"
 #include "loader/runtimeLinker.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace Loader::DemonsSoulsHdOutput {
@@ -18,6 +22,7 @@ namespace {
 
 bool                    g_active    = false;
 bool                    g_upscaled  = false; // with the PS5 Pro path (DemonsSoulsSuperResolution::HdOutput)
+bool                    g_late      = false; // at the late DLSS output's size (LateOutputHeight)
 bool                    g_layout_4k = false; // InterfaceAtOutput
 uint32_t                g_wide      = 0;     // WideOutputWidth
 std::array<uint64_t, 3> g_modes {};          // the three choices' immediates: video out, renderer, interface
@@ -45,20 +50,51 @@ uint32_t CustomOutputHeight() {
 	return height;
 }
 
+uint32_t LateOutputHeight() {
+	static const uint32_t height = [] {
+		const char* value = std::getenv("KYTY_LATE_DLSS");
+		if (value == nullptr || *value == 0) return 0u;
+		const auto  parsed   = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		const char* framegen = std::getenv("KYTY_FRAMEGEN");
+		const char* upscaler = std::getenv("KYTY_UPSCALER");
+		const char* output   = std::getenv("KYTY_LATE_DLSS_OUTPUT");
+		// (2160: the 4K output already. Without frame generation, or with the PS5 Pro path, no late DLSS.)
+		if (parsed < HdHeight || parsed >= DemonsSoulsRenderSize::OutputHeight || framegen == nullptr ||
+		    std::atoi(framegen) <= 0 || (upscaler != nullptr && *upscaler != 0 && std::strcmp(upscaler, "off") != 0))
+			return 0u;
+		if (output != nullptr && std::strcmp(output, "4k") == 0) {
+			std::printf("Demon's Souls HD output: KYTY_LATE_DLSS_OUTPUT=4k: late DLSS with the game's 4K output\n");
+			return 0u;
+		}
+		return parsed;
+	}();
+	return height;
+}
+
+uint32_t OutputWidth() {
+	return g_late ? UpscaledWidth() : HdWidth;
+}
+
+uint32_t OutputHeight() {
+	return g_late ? UpscaledHeight() : HdHeight;
+}
+
 uint32_t UpscaledHeight() {
+	if (LateOutputHeight() != 0) return LateOutputHeight();
 	return CustomOutputHeight() != 0 ? CustomOutputHeight() : HdHeight;
 }
 
 uint32_t UpscaledWidth() {
+	if (LateOutputHeight() != 0) return DemonsSoulsRenderSize::RenderSizeFor(LateOutputHeight()).width;
 	return CustomOutputHeight() != 0 ? DemonsSoulsRenderSize::RenderSizeFor(CustomOutputHeight()).width : HdWidth;
 }
 
 bool InterfaceScaled() {
-	return g_active && g_upscaled && CustomOutputHeight() > HdHeight && !g_layout_4k;
+	return g_active && (g_upscaled || g_late) && UpscaledHeight() > HdHeight && !g_layout_4k;
 }
 
 bool InterfaceAtOutput() {
-	return g_active && g_upscaled && g_layout_4k;
+	return g_active && (g_upscaled || g_late) && g_layout_4k;
 }
 
 uint32_t WideOutputWidth() {
@@ -66,6 +102,8 @@ uint32_t WideOutputWidth() {
 }
 
 bool Requested() {
+	// Late DLSS's output (LateOutputHeight): the HD path at that size.
+	if (LateOutputHeight() != 0) return true;
 	// KYTY_OUTPUT_HEIGHT: the PS5 Pro path's output at that height (with an upscaler only: the game's own HD path has no
 	// other size).
 	if (const char* upscaler = std::getenv("KYTY_UPSCALER");
@@ -122,28 +160,86 @@ void Install(Program* program) {
 		            "output kept\n");
 		return;
 	}
+	// Late DLSS's output above 1080 (LateOutputHeight): display mode 1's output pair - the 1920x1080 its cases (the
+	// setter's and the constructor's DemonsSoulsRenderSize::ModeCase, with its 1600x900 render pair after it) load, a
+	// constant other code may share - made a constant of its own in int3 padding that those cases load instead, and its
+	// entries of the output tables; the rest below as KYTY_OUTPUT_HEIGHT's. All found first, else the 4K output as
+	// without the HD path (late DLSS then scales to it, frame-gen.cpp).
+	const bool              late = !upscaled && LateOutputHeight() > HdHeight;
+	std::vector<uint64_t>   mode_cases;
+	std::optional<uint64_t> own_pair, output_widths, output_heights;
+	if (late) {
+		namespace Size   = DemonsSoulsRenderSize;
+		const auto holds = [](uint64_t address, uint32_t pair_width, uint32_t pair_height) {
+			uint32_t pair[2] {};
+			if (!Libs::Graphics::HostMemoryRangeIsReadable(address, sizeof(pair))) return false;
+			std::memcpy(pair, reinterpret_cast<const void*>(address), sizeof(pair));
+			return pair[0] == pair_width && pair[1] == pair_height;
+		};
+		// (The RIP-relative target of the disp32 at `site` + `at`, the instruction ending at `site` + `next`.)
+		const auto target = [](uint64_t site, uint32_t at, uint32_t next) {
+			int32_t displacement = 0;
+			std::memcpy(&displacement, reinterpret_cast<const void*>(site + at), sizeof(displacement));
+			return site + next + static_cast<int64_t>(displacement);
+		};
+		const auto mode = static_cast<size_t>(Size::HdUpscaledMode);
+		for (const auto site: GuestCode::Find(*program, GuestCode::Pattern(Size::ModeCase), 64)) {
+			if (holds(target(site, 4, 8), HdWidth, HdHeight) && holds(target(site, 12, 16), Size::ModeWidths[mode], Size::ModeHeights[mode]))
+				mode_cases.push_back(site);
+		}
+		// (Eight bytes at an aligned place in the 24 int3 after the ret.)
+		if (const auto padding = GuestCode::Find(*program, GuestCode::Pattern(Padding), 1); !padding.empty())
+			own_pair = (padding[0] + 1u + 7u) & ~uint64_t {7};
+		output_widths  = Size::FindUniqueData(*program, std::span(reinterpret_cast<const uint8_t*>(Size::OutputWidths),
+		                                                          sizeof(Size::OutputWidths)));
+		output_heights = Size::FindUniqueData(*program, std::span(reinterpret_cast<const uint8_t*>(Size::OutputHeights),
+		                                                          sizeof(Size::OutputHeights)));
+		const bool reached = own_pair && std::all_of(mode_cases.begin(), mode_cases.end(), [&](uint64_t site) {
+			const int64_t displacement = static_cast<int64_t>(*own_pair) - static_cast<int64_t>(site + 8);
+			return displacement >= std::numeric_limits<int32_t>::min() && displacement <= std::numeric_limits<int32_t>::max();
+		});
+		if (mode_cases.empty() || !reached || !output_widths || !output_heights) {
+			std::printf("Demon's Souls HD output: late DLSS's %ux%u output: display mode 1's output places of a known build "
+			            "(01.007.000) not found (%zu cases, padding %s, output tables %s); the 4K output kept\n",
+			            UpscaledWidth(), UpscaledHeight(), mode_cases.size(), own_pair ? "found" : "not found",
+			            output_widths && output_heights ? "found" : "not found");
+			return;
+		}
+	}
 	// Installation occurs before module initializers or guest threads run; program memory is writable to the host.
 	g_modes = {*video, *renderer, *interface};
 	for (const auto at: VideoOutOverrides) Nop(*video + at, 3);
 	for (const auto at: RendererOverrides) Nop(*renderer + at, 3);
 	Nop(*interface + InterfaceOverrides[0], 3);
 	Nop(*interface + InterfaceOverrides[1], 4);
-	const uint32_t width  = upscaled ? UpscaledWidth() : HdWidth;
-	const uint32_t height = upscaled ? UpscaledHeight() : HdHeight;
+	const uint32_t width  = upscaled || late ? UpscaledWidth() : HdWidth;
+	const uint32_t height = upscaled || late ? UpscaledHeight() : HdHeight;
+	if (late) {
+		const uint32_t pair[2] {width, height};
+		std::memcpy(reinterpret_cast<void*>(*own_pair), pair, sizeof(pair));
+		for (const auto site: mode_cases) {
+			const auto displacement = static_cast<int32_t>(static_cast<int64_t>(*own_pair) - static_cast<int64_t>(site + 8));
+			std::memcpy(reinterpret_cast<void*>(site + 4), &displacement, sizeof(displacement));
+		}
+		const auto entry = static_cast<uint64_t>(DemonsSoulsRenderSize::HdUpscaledMode) * sizeof(uint32_t);
+		std::memcpy(reinterpret_cast<void*>(*output_widths + entry), &width, sizeof(width));
+		std::memcpy(reinterpret_cast<void*>(*output_heights + entry), &height, sizeof(height));
+	}
 	// KYTY_OUTPUT_HEIGHT above 1080 (InterfaceAtOutput; KYTY_OUTPUT_LAYOUT=hd: not): the interface's 4K layout at the
 	// output's size, below. With a wider KYTY_RENDER_ASPECT the wide output at that height (WideOutputWidth), the display
-	// buffers as wide: the game copies its output into them for the frames without the 3D (issue #198).
-	const char* layout = std::getenv("KYTY_OUTPUT_LAYOUT");
-	const auto  screen = upscaled && CustomOutputHeight() > HdHeight && (layout == nullptr || std::strcmp(layout, "hd") != 0)
-	                         ? GuestCode::FindUnique(*program, GuestCode::Pattern(ScreenSize))
-	                         : std::nullopt;
+	// buffers as wide: the game copies its output into them for the frames without the 3D (issue #198). Late DLSS's
+	// output the same, without the wide output (its 3D squeezed into the 16:9 output, as the HD path's).
+	const char* layout  = std::getenv("KYTY_OUTPUT_LAYOUT");
+	const bool  at_size = ((upscaled && CustomOutputHeight() > HdHeight) || late) &&
+	                     (layout == nullptr || std::strcmp(layout, "hd") != 0);
+	const auto  screen  = at_size ? GuestCode::FindUnique(*program, GuestCode::Pattern(ScreenSize)) : std::nullopt;
 	if (screen) {
 		const char* aspect = std::getenv("KYTY_RENDER_ASPECT");
 		const char* wide   = std::getenv("KYTY_WIDE_OUTPUT");
 		const auto  value  = aspect != nullptr && *aspect != 0 ? DemonsSoulsRenderSize::ParseAspect(aspect) : 0.0;
-		if (value != 0.0 && (wide == nullptr || std::strcmp(wide, "0") != 0))
+		if (upscaled && value != 0.0 && (wide == nullptr || std::strcmp(wide, "0") != 0))
 			g_wide = DemonsSoulsRenderSize::RenderSizeFor(height, value).width;
-	} else if (upscaled && CustomOutputHeight() > HdHeight && (layout == nullptr || std::strcmp(layout, "hd") != 0)) {
+	} else if (at_size) {
 		std::printf("Demon's Souls HD output: the interface's screen size not found; its HD layout scaled instead\n");
 	}
 	const uint32_t buffer_width = g_wide != 0 ? g_wide : width;
@@ -152,8 +248,8 @@ void Install(Program* program) {
 		std::memcpy(reinterpret_cast<void*>(site + 6), &height, sizeof(height));
 	}
 	if (!upscaled) {
-		// The ceilings' mov r64, 2160 << 32 | 3840 (the immediate after the opcode's two bytes).
-		const uint64_t ceiling = static_cast<uint64_t>(HdHeight) << 32u | HdWidth;
+		// The ceilings' mov r64, 2160 << 32 | 3840 (the immediate after the opcode's two bytes): the output's.
+		const uint64_t ceiling = static_cast<uint64_t>(height) << 32u | width;
 		std::memcpy(reinterpret_cast<void*>(setter[0] + 6), &ceiling, sizeof(ceiling));
 		std::memcpy(reinterpret_cast<void*>(builder[0] + 9), &ceiling, sizeof(ceiling));
 		std::memcpy(reinterpret_cast<void*>(query[0] + 5), &ceiling, sizeof(ceiling));
@@ -204,13 +300,20 @@ void Install(Program* program) {
 	}
 	g_active   = true;
 	g_upscaled = upscaled;
-	SetMode(2);
+	g_late     = late;
+	// (Late DLSS's output: display mode 1 at once, the one whose output is the output's - DemonsSoulsRenderSize takes it
+	// too -, not mode 2 until then.)
+	SetMode(late ? DemonsSoulsRenderSize::HdUpscaledMode + 1 : 2);
 	if (upscaled) {
 		std::printf("Demon's Souls HD output: the interface at %s over the PS5 Pro path's %ux%u output%s\n",
 		            g_layout_4k ? g_wide != 0 ? "the output's 16:9 part (its 4K layout)" : "the output's size (its 4K layout)"
 		                        : "1920x1080 (its HD layout)",
 		            g_wide != 0 ? g_wide : width, height,
 		            CustomOutputHeight() != 0 && !g_layout_4k ? " (KYTY_OUTPUT_HEIGHT; the interface scaled to it)" : "");
+	} else if (late) {
+		std::printf("Demon's Souls HD output: late DLSS's %ux%u output (KYTY_LATE_DLSS): the game's HD path (display mode "
+		            "1) at that size, the interface %s\n",
+		            width, height, g_layout_4k ? "in its 4K layout at the output's size" : "in its HD layout scaled to it");
 	} else {
 		std::printf("Demon's Souls HD output: the game's HD path (display mode 2: output, post-processing and interface at "
 		            "1920x1080) is on\n");

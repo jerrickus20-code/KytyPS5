@@ -23,12 +23,25 @@ struct Program;
 namespace DemonsSoulsHdOutput {
 // KYTY_HD_OUTPUT is set (before Install: the other patches keep out of its way), or KYTY_OUTPUT_HEIGHT with an upscaler.
 [[nodiscard]] bool Requested();
+// KYTY_LATE_DLSS=<1080..2159> with frame generation (KYTY_FRAMEGEN) and no KYTY_UPSCALER (as local/frame-gen.cpp takes it):
+// late DLSS makes the finished picture that high just before the final composite, so the HD path runs with its output
+// at that height (16:9: 2560x1440 for 1440) instead of its 1920x1080, and instead of the 4K output the game would else
+// make and the presenter scale down to the window. The game's frame stays the HD path's (its TAA or the late DLSS's copy
+// of it, bloom, depth of field at the render size), the composite takes DLSS's picture at its own size and lays the
+// interface over it, in its 4K layout at the output's size (as KYTY_OUTPUT_HEIGHT's): display mode 1's output pair is
+// given a constant of its own (the game's 1920x1080 may be shared), its output table entries, the display buffers and
+// the ceilings the output's. KYTY_LATE_DLSS_OUTPUT=4k keeps the 4K output (a comparison). 0 when not.
+[[nodiscard]] uint32_t LateOutputHeight();
+// The HD path's output without the PS5 Pro path, once Install took it: 1920x1080, or the late DLSS output's.
+[[nodiscard]] uint32_t OutputWidth();
+[[nodiscard]] uint32_t OutputHeight();
 // KYTY_OUTPUT_HEIGHT=<1080..2159>, with the PS5 Pro path (KYTY_UPSCALER): its output at that height instead of the HD
 // output's 1080, 16:9 (2560x1440 for 1440: a 1440p screen gets DLSS's own picture, neither the 4K one scaled down nor
 // the 1080p one scaled up) - the 1080p output's places, the display buffers that size, the interface in its HD layout
 // scaled to the output (InterfaceScaled); 0 when unset or out of range.
 [[nodiscard]] uint32_t CustomOutputHeight();
-// The PS5 Pro path's output with the HD output: 1920x1080, or KYTY_OUTPUT_HEIGHT's size.
+// The PS5 Pro path's output with the HD output: 1920x1080, or KYTY_OUTPUT_HEIGHT's size; the late DLSS output's
+// (LateOutputHeight) without it.
 [[nodiscard]] uint32_t UpscaledWidth();
 [[nodiscard]] uint32_t UpscaledHeight();
 // KYTY_OUTPUT_HEIGHT's output above 1080: the interface in its 4K layout at the output's size (InterfaceAtOutput), or
@@ -89,5 +102,7 @@ inline constexpr std::string_view ScreenSize =
     "74 29 31 c9 83 f8 03 48 8d 05 ?? ?? ?? ?? c5 fb 10 85 78 fc ff ff 0f 92 c1 c4 e2 79 18 0c 88 c5 f8 59 c1 c5 f8 13 "
     "85 78 fc ff ff 48 8d 7b 08";
 inline constexpr uint32_t ScreenSizeBytes = 43;
+// Unreachable int3 padding after a ret, for the late DLSS output's own output pair (8 bytes at an aligned place in it).
+inline constexpr std::string_view Padding = "c3 cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc";
 } // namespace DemonsSoulsHdOutput
 } // namespace Loader
