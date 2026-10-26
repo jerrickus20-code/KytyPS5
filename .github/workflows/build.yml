@@ -110,7 +110,8 @@ jobs:
           $out = "_Build\package\$env:PACKAGE"
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll",
-            _Build\launcher\KytyLauncher.exe, run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
+            _Build\launcher\KytyLauncher.exe, run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd,
+            run-latedlss-1440-cheats.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
           Copy-Item run-windows.json "$out\launch.json"
           Copy-Item docs\PORTABLE-README.md "$out\README.md"
