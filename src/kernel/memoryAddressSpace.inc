@@ -1788,6 +1788,22 @@ public:
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// KYTY_READ_GUARD_RACES=1 (diagnostics): a guard fault whose page another thread read before it is guarded again
+	// (read_guard_races). The faulting read left the page out of the working set; in it now, another thread's read
+	// brought it in, and read the bytes the fault is about to replace (pressure mode at the Tower of Latria's start: ~1 a
+	// frame of ~100 guard faults; the hot pages' no access, 0.0).
+	static void CountReadGuardRace(uint64_t page) {
+		static const bool on = [] {
+			const char* value = std::getenv("KYTY_READ_GUARD_RACES");
+			return value != nullptr && *value == '1';
+		}();
+		if (!on) return;
+		PSAPI_WORKING_SET_EX_INFORMATION entry {};
+		entry.VirtualAddress = reinterpret_cast<void*>(page);
+		if (K32QueryWorkingSetEx(GetCurrentProcess(), &entry, sizeof(entry)) != 0 && entry.VirtualAttributes.Valid != 0)
+			LiveCounters::Add(LiveCounters::ReadGuardRaces);
+	}
+
 	// KYTY_READ_GUARD: the 4 KiB page of `vaddr` guarded again after its guard raised a fault, when it is a guest view's
 	// (true). At once, without the lock: Windows took the guard off as it raised the fault, and until it is back any other
 	// thread reads the page without a fault - a GPU-written page's stale bytes, a texture-offloaded page's zeros. The
@@ -1803,6 +1819,7 @@ public:
 		if (VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) != sizeof(info) ||
 		    info.Type != MEM_MAPPED || info.State != MEM_COMMIT)
 			return false;
+		CountReadGuardRace(page);
 		if (DWORD old = 0; VirtualProtect(reinterpret_cast<void*>(page), Page, PAGE_GUARD | PAGE_READONLY, &old) != 0)
 			return true;
 		std::shared_lock lock(m_mutex);
@@ -1858,18 +1875,21 @@ public:
 	}
 
 	// Whether the PC is short of memory for no-access pages (NoteRead): less than KYTY_HOT_READS_MIN_AVAIL_MB (default
-	// 2048; 0: never) of RAM left, until 1 GiB more is. The blue screens came with less than 1.5 GB left (issues #5, #47,
-	// #50, #91; the laptop's and this desktop's under a memory hog), when Windows takes pages and page tables out of RAM.
+	// 1536; 0: never) of RAM left, until 512 MiB more is. The blue screens came with less than 1.5 GB left (issues #5,
+	// #47, #50, #91; the laptop's and this desktop's under a memory hog), when Windows takes pages and page tables out of
+	// RAM. Each guard is a gap other threads read stale bytes in: at the Tower of Latria's start ~1 a frame with guards
+	// everywhere, none with these pages' no access (KYTY_READ_GUARD_RACES=1); and 16 GB PCs spend whole sessions around
+	// 2 GB left (issue #159: 2.0-2.5 GB the median), so from 2 GB, leaving at 3, they flickered as before the hot pages.
 	bool HotReadsPressure() {
 		static const uint64_t minimum = [] {
 			const char* value = std::getenv("KYTY_HOT_READS_MIN_AVAIL_MB");
-			return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {2048}) << 20u;
+			return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {1536}) << 20u;
 		}();
 		bool pressure = m_hot_pressure.load(std::memory_order_relaxed);
 		if (minimum == 0) return pressure;
 		const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
 		if (available == 0) return pressure;
-		const bool next = pressure ? available < minimum + (uint64_t {1} << 30u) : available < minimum;
+		const bool next = pressure ? available < minimum + (uint64_t {512} << 20u) : available < minimum;
 		if (next != pressure) {
 			m_hot_pressure.store(next, std::memory_order_relaxed);
 			static std::atomic<uint32_t> reports {0};

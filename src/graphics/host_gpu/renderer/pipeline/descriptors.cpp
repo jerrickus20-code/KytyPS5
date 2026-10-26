@@ -584,8 +584,9 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 // layer's kept levels the first bytes of its own (the game's writes to the left-out ones then count as the array's: its
 // range takes them in): the texture pools' 1024x1024 arrays at 1-1 (256 and 64 layers) took 470 of the 1,313 MiB left
 // with one level out. Shaders sample the smaller texture (half the texels across); size queries, explicit levels and
-// texel loads see it too (a little blur).
-static uint32_t TextureReduceLevels(bool small_video_memory) {
+// texel loads see it too (a little blur). Demon's Souls streams none of the levels left out into its memory either
+// (loader/demonsSoulsTextureMips.cpp).
+uint32_t TextureReduceLevels(bool small_video_memory) {
 	static const uint32_t levels = [&] {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
 		const uint32_t chosen = value != nullptr && value[0] != '\0'

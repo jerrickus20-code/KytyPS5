@@ -1070,6 +1070,18 @@ int DisplayRefreshHz(void* window) {
 	return mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) : 0;
 }
 
+void ReturnFocus(void* window) {
+	const char* value = std::getenv("KYTY_RETURN_FOCUS");
+	if (value == nullptr || *value == '\0') return;
+	const auto target = reinterpret_cast<HWND>(static_cast<uintptr_t>(std::strtoull(value, nullptr, 10)));
+	if (target == nullptr || target == static_cast<HWND>(window) || IsWindow(target) == FALSE) return;
+	// Handed over while the game's window has the focus (Windows lets the process that has it give it away), then the
+	// game's window hidden: hidden first, Windows would give the focus to a window of its own choosing.
+	if (IsIconic(target) != FALSE) ShowWindow(target, SW_RESTORE);
+	SetForegroundWindow(target);
+	if (window != nullptr) ShowWindow(static_cast<HWND>(window), SW_HIDE);
+}
+
 bool StartDisplayVblanks(void* window) {
 	g_display_vblanks.window.store(static_cast<HWND>(window));
 	if (g_display_vblanks.started.load()) return true;
@@ -2045,6 +2057,8 @@ void MakeCriticalThread() {
 int DisplayRefreshHz(void* /*window*/) {
 	return 0;
 }
+
+void ReturnFocus(void* /*window*/) {}
 
 bool StartDisplayVblanks(void* /*window*/) {
 	return false;

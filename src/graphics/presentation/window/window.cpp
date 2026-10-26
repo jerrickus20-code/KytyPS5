@@ -14,6 +14,7 @@
 #include "SDL_rwops.h"
 #include "SDL_stdinc.h"
 #include "SDL_surface.h"
+#include "SDL_syswm.h"
 #include "SDL_thread.h"
 #include "SDL_touch.h"
 #include "SDL_video.h"
@@ -38,6 +39,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "debug-snapshot.h"
+#include "local-platform.h"
 #include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -1100,6 +1102,14 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The focus back to the window that had it before the game (KYTY_RETURN_FOCUS), before the caches are saved.
+	if (SDL_SysWMinfo info {}; g_window->window != nullptr) {
+		SDL_VERSION(&info.version);
+		if (SDL_GetWindowWMInfo(g_window->window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS)
+			LocalPlatform::ReturnFocus(info.info.win.window);
+	}
+#endif
 	g_window->render_context->GetPipelineCache().StopWarmup();
 	g_window->render_context->GetPipelineCache().ReportSession();
 	g_window->render_context->GetPipelineCache().Save();
