@@ -16,6 +16,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -184,6 +185,8 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
                 uint64_t motion_address);
 // The game's super resolution dispatch in place of its TAA (renderSuperResolution.cpp): the same depth and motion.
 void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address);
+// Renderer thread, at a TAA dispatch (KYTY_LATE_DLSS): its depth and motion vectors of `extent`; the largest kept.
+void OnLateDispatch(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address, vk::Extent2D extent);
 // At the guest flip, in the frame's command buffer: copy the gathered images into `inputs`.
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs);
@@ -221,6 +224,77 @@ struct UpscaleInputs {
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
+// Image quality (KYTY_DLSS, KYTY_NIS), Streamline features next to DLSS-G (they need KYTY_FRAMEGEN):
+//   KYTY_DLSS=1        DLSS in place of the game's TAA pass, at the same size (DLAA): the TAA's color, depth and motion
+//                      in, its output image out. The rest of the frame (post-processing at render size) is unchanged.
+//   KYTY_NIS=<height>  NVIDIA Image Scaling of the finished picture to <height> lines (16:9, 720..2160) before the
+//                      game's final composite stretches it to its 4K output (KYTY_NIS_SHARPNESS, 0..1, default 0.3).
+// The final composite: the pixel shader that lays the 4K UI layer over the render-size picture (texture slot 1).
+constexpr uint64_t FinalCompositePixelShader = 0x1ad8b5870fe4d3ecULL;
+constexpr uint32_t FinalCompositeSceneSlot   = 1;
+// HDR runs (--hdr, the HDR launcher): the game's final composite there is another pixel shader (NIS never ran in HDR,
+// 10-22). Its scene slot when NIS takes the other composites too: 0x3359df0b33704924 (frame-gen-hudless.cpp's composite of
+// a smaller scene, the scene after the HUD layer) and KYTY_NIS_SHADERS=<hash>:<slot>,... (hex hashes); -1: not one.
+[[nodiscard]] int NisHdrCompositeSlot(uint64_t pixel_shader);
+// The final composite's scene slot that NIS replaces (FinalCompositePixelShader; the HDR composites in HDR runs), or -1.
+[[nodiscard]] inline int NisCompositeSlot(uint64_t pixel_shader) {
+	return pixel_shader == FinalCompositePixelShader ? static_cast<int>(FinalCompositeSceneSlot)
+	                                                 : NisHdrCompositeSlot(pixel_shader);
+}
+// The picture DLAA makes (the full-size TAA pass's size; {0, 0} before one), for the HDR runs' composite search log.
+[[nodiscard]] vk::Extent2D NisSceneExtent();
+// The TAA dispatch's images (KYTY_SHADER_DUMP / frame capture): color, depth, motion in, the output.
+constexpr uint32_t TaaColorSlot = 0, TaaDepthSlot = 1, TaaMotionSlot = 3, TaaOutputSlot = 6;
+struct SrImage {
+	vk::Image           image  = nullptr;
+	vk::ImageView       view   = nullptr;
+	vk::Format          format = vk::Format::eUndefined;
+	vk::Extent2D        extent {};
+	vk::ImageLayout     layout = vk::ImageLayout::eUndefined;
+	vk::ImageUsageFlags usage {};
+};
+// The TAA's exposure: the game's TAA multiplies its color input by the first float of this range (eye adaptation,
+// written on the GPU by the pass before it); DLSS's result gets the same factor (null buffer: none).
+struct TaaExposure {
+	vk::Buffer     buffer = nullptr;
+	vk::DeviceSize offset = 0;     // aligned, as bound
+	vk::DeviceSize range  = 0;
+	uint32_t       index  = 0;     // the float's index in the bound range
+};
+[[nodiscard]] bool DlssEnabled();
+[[nodiscard]] bool NisEnabled();
+// NIS set up (KYTY_NIS), on or off (Shift+F6): the final composite must take the path with NIS's hook (table-xpr.inc).
+[[nodiscard]] bool NisAvailable();
+// Renderer thread, at the TAA dispatch once its bindings are committed (outside rendering): DLSS writes `output`
+// from the inputs. False: nothing was recorded, the game's TAA runs.
+[[nodiscard]] bool EvaluateDlss(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& color,
+                                const SrImage& depth, const SrImage& motion, const SrImage& output,
+                                const TaaExposure& exposure);
+// KYTY_LATE_DLSS with KYTY_LATE_DLSS_AA=1, late DLSS on (Shift+F6): the game's TAA is not run; DLSS after the
+// post-processing does the anti-aliasing and the upscale both, from the jittered picture.
+[[nodiscard]] bool LateAaEnabled();
+// Renderer thread, at the full-size TAA dispatch (LateAaEnabled): its color input copied into its output, the TAA's
+// exposure applied (as after DLAA). False: nothing recorded, the game's TAA runs.
+[[nodiscard]] bool PassThroughTaa(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& color,
+                                  const SrImage& output, const TaaExposure& exposure);
+// Renderer thread, before the final composite's bindings are committed (outside rendering, `scene` shader-readable):
+// `scene` scaled by NIS into an image of its own; the view to bind in its place (shader-read-only), or null.
+// KYTY_LATE_DLSS (`cache` given): DLSS super resolution of `scene` in NIS's place (frame-gen.cpp EvaluateLateDlss).
+[[nodiscard]] vk::ImageView EvaluateNis(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& scene,
+                                        TextureCache* cache = nullptr);
+// In-game switches (window.cpp: F6 DLAA, Shift+F6 NIS, Ctrl+F6 / Ctrl+Shift+F6 NIS sharper / softer, F4 the 30 fps
+// cap, F12 the FPS panel; F1-F3, F5, F10, F11 are the cheats', F7 the mouse camera), remembered in KYTY_TOGGLE_FILE
+// (dlss=, nis=, cap=, sharp= (0..100), hud= lines; without the file: DLAA and NIS on, the cap from KYTY_FLIP_RATE). A short note on screen says the new state.
+enum class Switch { Dlss, Nis, Cap, NisSharper, NisSofter, Hud };
+void Toggle(Switch which);
+// The 30 fps cap now: 0 (none) or KYTY_FLIP_RATE's 1..2 (videoOut.cpp, at every flip).
+[[nodiscard]] int FlipRateFloor();
+// The note of the last switch for a few seconds (empty after).
+[[nodiscard]] std::string HudNotice();
+// A line shown as HudNotice for 2.5 s (the F11 cheat switch, loader/cheatHotkey.h).
+void ShowNotice(std::string note);
+// The KYTY_FPS_HUD panel shown (F12; `fallback`: KYTY_FPS_HUD until the switch is used or remembered).
+[[nodiscard]] bool HudShown(bool fallback);
 // Records DLSS into `command` (outside a render pass; the images in their `layout`s, left so): false when it could not.
 // `dispatch` records the commands DLSS needs around it (the recording worker's when it replays).
 [[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs,
@@ -242,6 +316,16 @@ struct UpscaleInputs {
 [[nodiscard]] bool PresenterGeneratesHdr();
 // Present thread: the frames the last rendered frame was shown as (1 + the generated ones), for PresentedFrames.
 void NotePresented(uint32_t frames);
+// KYTY_LIVE_FILE `taaprobe` (debugging): the next full-size TAA pass runs as the game's, then DLSS on the same inputs;
+// pixels of its color input, the game's result and DLSS's result are logged (TAAPROBE lines) a few frames later.
+[[nodiscard]] bool TaaProbeWanted(vk::Extent2D extent);
+void TaaProbe(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& color, const SrImage& depth,
+              const SrImage& motion, const SrImage& output, const TaaExposure& exposure);
+// KYTY_LIVE_FILE commands, while the game runs: `dlss on|off`, `nis on|off`, `dlssexp auto|off`, `dlsshdr on|off`, `dlssalpha on|off`, `taaprobe`, `dlssexposure on|off`, `taaalpha keep|<value>`,
+// `nishdr none|linear|pq`, `nissharp <0..1>`. False: not one of these, or a bad value.
+bool LiveCommand(std::string_view command, std::string_view value);
+// For the KYTY_FPS_HUD panel: "DLAA on  |  NIS on" (empty without KYTY_DLSS / KYTY_NIS).
+[[nodiscard]] const char* QualityLabel();
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

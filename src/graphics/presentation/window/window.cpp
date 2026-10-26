@@ -30,6 +30,8 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "loader/cheatGiveCore.h"
+#include "loader/cheatHotkey.h"
 #include "loader/demonsSoulsWarp.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -281,11 +283,47 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 					PerfOverlay::CycleLevel();
 				}
 				break;
+			// F1-F3, F5, F10, F11: cheat switches when KYTY_CHEAT_KEYS sets them up (loader/cheatHotkey.h); F11 without
+			// one switches fullscreen.
+			case SDLK_F1:
+			case SDLK_F2:
+			case SDLK_F3:
+			case SDLK_F5:
+			case SDLK_F10:
 			case SDLK_F11:
 				if (!key.repeat) {
-					ToggleDesktopFullscreen();
+					const char* name = key.key_code == SDLK_F1 ? "F1" : key.key_code == SDLK_F2 ? "F2"
+					                 : key.key_code == SDLK_F3 ? "F3" : key.key_code == SDLK_F5 ? "F5"
+					                 : key.key_code == SDLK_F10 ? "F10" : "F11";
+					if (key.key_code == SDLK_F10 &&
+					    Loader::CheatGive::TogglePanel([](std::string note) { ::Libs::Graphics::FrameGen::ShowNotice(std::move(note)); })) {
+						return;
+					}
+					if (auto note = Loader::CheatHotkey::Toggle(name); !note.empty()) {
+						::Libs::Graphics::FrameGen::ShowNotice(std::move(note));
+						return;
+					}
+					if (key.key_code == SDLK_F11) ToggleDesktopFullscreen();
 				}
 				break;
+			// F4: the 30 fps cap on or off; F12: the FPS panel (frame-gen.h, remembered for the next start).
+			case SDLK_F4:
+				if (!key.repeat) ::Libs::Graphics::FrameGen::Toggle(::Libs::Graphics::FrameGen::Switch::Cap);
+				return;
+			case SDLK_F12:
+				if (!key.repeat) ::Libs::Graphics::FrameGen::Toggle(::Libs::Graphics::FrameGen::Switch::Hud);
+				return;
+			// F6: DLAA on or off; Shift+F6: NIS on or off; Ctrl+F6 / Ctrl+Shift+F6: NIS sharper / softer (KYTY_DLSS /
+			// KYTY_NIS, frame-gen.h, remembered for the next start). (F7 is the mouse camera's.)
+			case SDLK_F6: {
+				if (key.repeat) return;
+				using ::Libs::Graphics::FrameGen::Switch;
+				const bool shift = (key.mod & KMOD_SHIFT) != 0, ctrl = (key.mod & KMOD_CTRL) != 0;
+				::Libs::Graphics::FrameGen::Toggle(ctrl    ? (shift ? Switch::NisSofter : Switch::NisSharper)
+				                                   : shift ? Switch::Nis
+				                                           : Switch::Dlss);
+				return;
+			}
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
 				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {

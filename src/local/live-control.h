@@ -19,6 +19,7 @@
 //   screenshot <path>             the next frame shown, read back from the GPU, as a PPM file (screenshot.h)
 //   set <name> <value>            a live switch (live-switch.h), e.g. fsr_jitter_mode 1
 //   sleep <seconds>
+//   dlss|nis on|off, dlssexp auto|off, dlsshdr on|off, dlssalpha on|off, taaprobe x, dlssexposure on|off, taaalpha keep|<v>, exposurescale <x>, nishdr none|linear|pq, nissharp <0..1>   (frame-gen.h)
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
 #include "common/assert.h"
@@ -67,6 +68,10 @@ extern "C" int  __llvm_profile_write_file(void);
 namespace Loader {
 std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr);
 } // namespace Loader
+
+namespace Libs::Graphics::FrameGen {
+bool LiveCommand(std::string_view command, std::string_view value); // frame-gen.h
+} // namespace Libs::Graphics::FrameGen
 
 namespace LiveControl {
 
@@ -661,6 +666,11 @@ inline void Run(uint64_t id, const std::string& line) {
 		std::printf("LIVE_SET id=%" PRIu64 " %s=%s ok=%d\n", id, arg1, arg2, ok ? 1 : 0);
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
+	} else if ((cmd == "dlss" || cmd == "nis" || cmd == "dlssexp" || cmd == "dlsshdr" || cmd == "dlssalpha" || cmd == "taaprobe" || cmd == "dlssexposure" || cmd == "taaalpha" || cmd == "exposurescale" || cmd == "nishdr" ||
+	            cmd == "nissharp") && n >= 2) {
+		// DLSS / NIS switches (frame-gen.h LiveCommand), e.g. `dlss off`, `nis on`, `nishdr linear`.
+		const bool ok = Libs::Graphics::FrameGen::LiveCommand(cmd, arg1);
+		std::printf("LIVE_FG id=%" PRIu64 " %s %s ok=%d\n", id, command, arg1, ok ? 1 : 0);
 	} else if (cmd == "capture" && n >= 2) {
 		// capture <dir> [frames] [hash,hash,...]: every draw/dispatch of the next frames, with
 		// the constants of the listed shaders (frame-capture.h).

@@ -16,6 +16,8 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/cheatGive.h"
+#include "loader/cheatHotkey.h"
 #include "loader/demonsSoulsIdle.h"
 #include "loader/demonsSoulsPageFree.h"
 #include "loader/demonsSoulsLanguages.h"
@@ -1632,6 +1634,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsLoaderGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsLanguages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	CheatHotkey::Install(m_programs.empty() ? nullptr : m_programs.front()); // (after the cheat file's code caves)
+	CheatGive::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");

@@ -496,6 +496,11 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
 	    FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash) && FrameGen::WantsCamera())
 		return TableResult::Native;
+	// KYTY_NIS: the final composite stays on the normal path, whose draw hook puts NIS's picture in its place (a table
+	// draw skips it: NIS ran once, at the title, then never in the game).
+	if (FrameGen::NisAvailable() && pair.programs[1] != nullptr &&
+	    FrameGen::NisCompositeSlot(pair.programs[1]->shader_hash) >= 0)
+		return TableResult::Native;
 	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
 	// while its programs and pipeline compile, the pair's draws take the normal path (Deferred). (Once a frame per pair
 	// kept its other states' draws on the native path, storing native records, until a later frame.) Those draws
@@ -1985,6 +1990,18 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	if (!table_state.programs.vertex || vertex == nullptr || !vertex->table_mode)
 		return refuse("no table mode vertex program");
 	if (vertex->stage != ShaderType::Vertex) return refuse("not a vertex program");
+	if (FrameGen::NisAvailable() && pixel != nullptr && FrameGen::NisCompositeSlot(pixel->shader_hash) >= 0)
+		return refuse("NIS replaces this draw's picture");
+	// HDR runs with NIS: the pixel shaders of the draws stored for the 4K output, the HDR composite's among them (a
+	// stored draw never reaches the normal path's NIS log; KYTY_NIS_SHADERS takes one off this path).
+	if (FrameGen::NisAvailable() && Config::HdrEnabled() && pixel != nullptr && state.color_count != 0 &&
+	    state.color_info[0].Extent().width >= 3840) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 48)
+			std::printf("NIS (HDR): a %ux%u output draw stored for the table path: pixel shader 0x%016llx, %zu images\n",
+			            state.color_info[0].Extent().width, state.color_info[0].Extent().height,
+			            static_cast<unsigned long long>(pixel->shader_hash), pixel->info.images.size());
+	}
 	if (state.ps_active && (!table_state.programs.pixel || pixel == nullptr || !pixel->table_mode))
 		return refuse("no table mode pixel program");
 	const std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {vertex, pixel};
