@@ -58,6 +58,15 @@ bool IsDepthFormat(vk::Format format) {
 	}
 }
 
+bool HasStencil(vk::Format format) {
+	switch (format) {
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32SfloatS8Uint: return true;
+		default: return false;
+	}
+}
+
 // The finished frame read as it is stored: its sRGB bytes as UNORM (the upscaler's output is UNORM's, nothing is
 // linearized on the way), as the presenter's frame takes them (Presenter::PrepareFrame).
 vk::Format StoredFormat(vk::Format format) {
@@ -138,14 +147,18 @@ bool Make(GraphicContext& graphics, Owned& owned, vk::Extent2D extent, vk::Forma
 // sampled.
 void CopyInto(vk::CommandBuffer command, vk::Image source, uint32_t level, uint32_t layer, Owned& target) {
 	const auto aspect = IsDepthFormat(target.image.format) ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
-	FrameGen::Transition(command, target.image, aspect, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	// (The depth alone is copied, but a depth and stencil image's barriers name both: the device has no
+	// separateDepthStencilLayouts.)
+	const vk::ImageAspectFlags barrier =
+	    HasStencil(target.image.format) ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil : aspect;
+	FrameGen::Transition(command, target.image, barrier, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	                     vk::PipelineStageFlagBits2::eTransfer);
 	vk::ImageCopy copy {};
 	copy.srcSubresource = {aspect, level, layer, 1};
 	copy.dstSubresource = {aspect, 0, 0, 1};
 	copy.extent         = target.image.extent;
 	command.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, target.image.image, vk::ImageLayout::eTransferDstOptimal, copy);
-	FrameGen::Transition(command, target.image, aspect, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
+	FrameGen::Transition(command, target.image, barrier, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
 	                     vk::PipelineStageFlagBits2::eAllCommands);
 }
 
