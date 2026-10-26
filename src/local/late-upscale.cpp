@@ -17,6 +17,7 @@
 #include <cstring>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::LateUpscale {
 namespace {
@@ -32,6 +33,18 @@ Owned                   g_depth, g_motion, g_color, g_output;
 FrameGen::UpscaleInputs g_parameters;
 bool                    g_captured = false; // the current guest frame's dispatch left its inputs
 bool                    g_history  = false; // the last guest frame was upscaled (else the next one starts a new history)
+uint64_t                g_flips    = 0;     // guest flips seen (Upscale)
+
+// An image made again (another size or format) is destroyed some flips later: the GPU, or the recording worker's queue,
+// may still hold commands using it (DeleteImage frees it, or pools it for another image, at once).
+struct Retired {
+	vk::Image     image      = nullptr;
+	VmaAllocation allocation = nullptr;
+	vk::ImageView view       = nullptr;
+	uint64_t      flip       = 0;
+};
+constexpr uint64_t   RetireFlips = 8;
+std::vector<Retired> g_retired;
 
 bool IsDepthFormat(vk::Format format) {
 	switch (format) {
@@ -64,12 +77,29 @@ void Report(const char* text) {
 	}
 }
 
-void Destroy(GraphicContext& graphics, Owned& owned) {
-	if (owned.view != nullptr) {
-		graphics.device.destroyImageView(owned.view, nullptr);
-		owned.view = nullptr;
-	}
-	if (owned.image.image != nullptr) graphics.DeleteImage(owned.image);
+// `owned` given up: destroyed RetireFlips flips from now (DestroyRetired).
+void Retire(Owned& owned) {
+	if (owned.image.image != nullptr || owned.view != nullptr)
+		g_retired.push_back({owned.image.image, owned.image.allocation, owned.view, g_flips});
+	owned.image.image      = nullptr;
+	owned.image.allocation = nullptr;
+	owned.image.state      = {};
+	owned.image.subresource_states.clear();
+	owned.view = nullptr;
+}
+
+void DestroyRetired(GraphicContext& graphics) {
+	std::erase_if(g_retired, [&](const Retired& retired) {
+		if (retired.flip + RetireFlips > g_flips) return false;
+		if (retired.view != nullptr) graphics.device.destroyImageView(retired.view, nullptr);
+		if (retired.image != nullptr) {
+			VulkanImage image;
+			image.image      = retired.image;
+			image.allocation = retired.allocation;
+			graphics.DeleteImage(image);
+		}
+		return true;
+	});
 }
 
 // `owned` (re)made as `format` of `extent` with `usage` and a view of the whole image; false (none) when the GPU cannot
@@ -78,7 +108,7 @@ bool Make(GraphicContext& graphics, Owned& owned, vk::Extent2D extent, vk::Forma
 	if (owned.image.image != nullptr && owned.image.format == format && owned.image.extent.width == extent.width &&
 	    owned.image.extent.height == extent.height && owned.image.usage == usage)
 		return true;
-	Destroy(graphics, owned);
+	Retire(owned);
 	vk::ImageCreateInfo create {};
 	create.imageType     = vk::ImageType::e2D;
 	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
@@ -98,7 +128,7 @@ bool Make(GraphicContext& graphics, Owned& owned, vk::Extent2D extent, vk::Forma
 	view.subresourceRange = {IsDepthFormat(format) ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 	if (graphics.device.createImageView(&view, nullptr, &owned.view) != vk::Result::eSuccess) {
 		owned.view = nullptr;
-		Destroy(graphics, owned);
+		graphics.DeleteImage(owned.image); // (never used)
 		return false;
 	}
 	return true;
@@ -231,6 +261,8 @@ vk::Extent2D OutputExtent(vk::Extent2D extent) {
 }
 
 VulkanImage* Upscale(GraphicContext& graphics, CommandBuffer& command, Image& source) {
+	++g_flips;
+	DestroyRetired(graphics);
 	const bool captured = std::exchange(g_captured, false);
 	const bool history  = std::exchange(g_history, false);
 	if (!captured) return nullptr; // (no 3D in this guest frame)
