@@ -17,6 +17,7 @@ setlocal
 set "CHEATS=%~dp0cheats"
 set "PATCH="
 if exist "%CHEATS%\PPSA01341_01.007.000.json" set PATCH=-Patch "%CHEATS%\PPSA01341_01.007.000.json"
+rem (The -Set list quoted: a folder with a space in its path stays one argument.)
 if not exist "%~dp0_dlss" mkdir "%~dp0_dlss"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow -Fullscreen -AspectFit -FrameGen 1 -RenderHeight 720 %PATCH% -Set KYTY_LATE_DLSS=1440,KYTY_LATE_DLSS_AA=1,KYTY_DLSS_PRESET=M,KYTY_CHEAT_KEYS=%CHEATS%\PPSA01341_01.007.000.keys.txt,KYTY_CHEAT_GIVE_SLOT=1E78A70,KYTY_CHEAT_ITEMS=%CHEATS%\PPSA01341_01.007.000.items.txt,KYTY_CHEAT_GIVE_FILE=%CHEATS%\give.txt,KYTY_TOGGLE_FILE=%~dp0_dlss\toggles.txt %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Prompt -Follow -Fullscreen -AspectFit -FrameGen 1 -RenderHeight 720 %PATCH% -Set "KYTY_LATE_DLSS=1440,KYTY_LATE_DLSS_AA=1,KYTY_DLSS_PRESET=M,KYTY_CHEAT_KEYS=%CHEATS%\PPSA01341_01.007.000.keys.txt,KYTY_CHEAT_GIVE_SLOT=1E78A70,KYTY_CHEAT_ITEMS=%CHEATS%\PPSA01341_01.007.000.items.txt,KYTY_CHEAT_GIVE_FILE=%CHEATS%\give.txt,KYTY_TOGGLE_FILE=%~dp0_dlss\toggles.txt" %*
 if %errorlevel% neq 0 pause
