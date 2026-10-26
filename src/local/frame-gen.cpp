@@ -356,6 +356,11 @@ bool                  g_nis_ready  = false;
 uint32_t              g_late_height = 0;
 bool                  g_late_ready  = false;
 bool                  g_late_aa     = false; // KYTY_LATE_DLSS_AA=1: no TAA before it; the jitter kept for DLSS
+// Renderer thread: late DLSS's failed evaluations (8: given up), and the TAA passes copied through since it last made a
+// picture (LateUnresolvedLimit: the game's TAA again, rather than a jittered, aliased picture from then on).
+uint32_t              g_late_failures   = 0;
+uint32_t              g_late_unresolved = 0;
+constexpr uint32_t    LateUnresolvedLimit = 120;
 // The full-size TAA pass's depth and motion vectors (OnLateDispatch: indoors the game runs the TAA shader again on a
 // quarter-size lighting buffer, whose images g_sources may hold last).
 struct LateSources {
@@ -2532,7 +2537,9 @@ bool NisEnabled() {
 
 bool LateAaEnabled() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	return g_ready && g_late_ready && g_late_aa && !g_nis_off.load(std::memory_order_relaxed);
+	// (Not once late DLSS gave up or stopped making pictures: the TAA's copy would be shown jittered and aliased.)
+	return g_ready && g_late_ready && g_late_aa && !g_nis_off.load(std::memory_order_relaxed) && g_late_failures < 8 &&
+	       g_late_unresolved < LateUnresolvedLimit;
 #else
 	return false;
 #endif
@@ -3149,6 +3156,12 @@ bool PassThroughTaa(GraphicContext& graphics, vk::CommandBuffer command, const S
 	if (move) relayout(src_layout, color.layout);
 	DirectFullBarrier(command);
 	ApplyExposure(graphics, command, output, exposure);
+	// (Late DLSS resets the count when it makes the frame's picture, after this.)
+	if (++g_late_unresolved == LateUnresolvedLimit) {
+		std::printf("Late DLSS: no picture made in %u frames whose TAA was copied through: the game's TAA runs again\n",
+		            LateUnresolvedLimit);
+		std::fflush(stdout);
+	}
 	return true;
 #else
 	(void)graphics;
@@ -3273,7 +3286,6 @@ vk::ImageView EvaluateNis(GraphicContext& graphics, vk::CommandBuffer command, c
 namespace {
 VulkanImage   g_late_image, g_late_depth, g_late_motion;
 vk::ImageView g_late_view = nullptr, g_late_depth_view = nullptr, g_late_motion_view = nullptr;
-uint32_t      g_late_failures    = 0;
 uint64_t      g_late_guest_frame = UINT64_MAX;
 uint64_t      g_late_evaluations = 0;
 vk::Extent2D  g_late_input {};
@@ -3361,7 +3373,7 @@ vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer comma
 			    options.ultraPerformancePreset = options.ultraQualityPreset = value;
 		}
 		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
-			std::printf("Late DLSS: slDLSSSetOptions failed (%d): the game's stretch stays\n", static_cast<int>(result));
+			std::printf("Late DLSS: slDLSSSetOptions failed (%d): the game's TAA and stretch stay\n", static_cast<int>(result));
 			std::fflush(stdout);
 			g_late_failures = 8;
 			return nullptr;
@@ -3420,11 +3432,12 @@ vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer comma
 	DirectLayout(command, g_late_image, vk::ImageLayout::eShaderReadOnlyOptimal);
 	if (!Evaluated(result)) {
 		std::printf("Late DLSS: evaluation failed (%d)%s\n", static_cast<int>(result),
-		            ++g_late_failures >= 8 ? ": the game's stretch stays" : "");
+		            ++g_late_failures >= 8 ? ": the game's TAA and stretch stay" : "");
 		std::fflush(stdout);
 		return nullptr;
 	}
 	g_late_guest_frame = g_guest_frame;
+	g_late_unresolved  = 0;
 	if (++g_late_evaluations == 1 || g_late_evaluations == 600) {
 		std::printf("Late DLSS: evaluated %llu time(s)\n", static_cast<unsigned long long>(g_late_evaluations));
 		std::fflush(stdout);
