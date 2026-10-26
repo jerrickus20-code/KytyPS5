@@ -218,6 +218,9 @@ struct UpscaleInputs {
 	bool         reset = false;                           // no history (a cut, a level load)
 	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
 	float        near_plane = 0.1f, far_plane = 3000.0f;
+	// The game's linear HDR scene before its tone mapping (automatic exposure), or its finished, tone-mapped frame (the
+	// late upscale, late-upscale.h).
+	bool         hdr = true;
 };
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();

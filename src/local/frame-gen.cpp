@@ -2033,7 +2033,8 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 		return false;
 	}
 	static vk::Extent2D options_render {}, options_output {};
-	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
+	static bool         options_hdr = true;
+	if (options_render != inputs.color.extent || options_output != inputs.output.extent || options_hdr != inputs.hdr) {
 		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
 		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA.
 		const double share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
@@ -2045,8 +2046,9 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 		                               : sl::DLSSMode::eUltraPerformance;
 		options.outputWidth     = inputs.output.extent.width;
 		options.outputHeight    = inputs.output.extent.height;
-		options.colorBuffersHDR = sl::Boolean::eTrue; // (the game's linear HDR scene, before its tone mapping)
-		options.useAutoExposure = sl::Boolean::eTrue;
+		// (The game's linear HDR scene, before its tone mapping; the late upscale's finished frame is tone-mapped.)
+		options.colorBuffersHDR = inputs.hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		options.useAutoExposure = inputs.hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		// KYTY_DLSS_PRESET=<letter> (a test): that DLSS model for every mode instead of the mode's default.
 		if (const char* preset = std::getenv("KYTY_DLSS_PRESET"); preset != nullptr && *preset >= 'A' && *preset <= 'O') {
 			const auto value = static_cast<sl::DLSSPreset>(*preset - 'A' + 1);
@@ -2060,10 +2062,10 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 		}
 		sl::DLSSOptimalSettings settings {};
 		(void)g_api.dlss_get_optimal_settings(options, settings);
-		std::printf("DLSS super resolution: %ux%u -> %ux%u, mode %u (its range %ux%u-%ux%u)\n", inputs.color.extent.width,
+		std::printf("DLSS super resolution: %ux%u -> %ux%u, mode %u (its range %ux%u-%ux%u)%s\n", inputs.color.extent.width,
 		            inputs.color.extent.height, inputs.output.extent.width, inputs.output.extent.height,
 		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
-		            settings.renderWidthMax, settings.renderHeightMax);
+		            settings.renderWidthMax, settings.renderHeightMax, inputs.hdr ? "" : ", tone-mapped input");
 		std::fflush(stdout);
 		if (settings.renderWidthMax != 0 && settings.renderHeightMax != 0 &&
 		    (inputs.color.extent.width < settings.renderWidthMin || inputs.color.extent.width > settings.renderWidthMax ||
@@ -2078,6 +2080,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 		}
 		options_render = inputs.color.extent;
 		options_output = inputs.output.extent;
+		options_hdr    = inputs.hdr;
 	}
 	static uint32_t frame = 0;
 	++frame;
@@ -2195,10 +2198,11 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 	if (!g_upscale_ready || g_dlss == nullptr) return false;
 	// (The renderer thread, or the recording worker replaying in order: one at a time.)
 	static vk::Extent2D created_render {}, created_output {};
-	static bool         created = false, failed = false;
+	static bool         created = false, failed = false, created_hdr = true;
 	static uint32_t     reports = 0;
 	if (failed) return false; // (the stretch, every frame, without asking NGX again)
-	if (!created || created_render != inputs.color.extent || created_output != inputs.output.extent) {
+	if (!created || created_render != inputs.color.extent || created_output != inputs.output.extent ||
+	    created_hdr != inputs.hdr) {
 		// The mode by the input's share of the output's height, as Windows' (Streamline) way: PS5 Pro's 1512 of 2160 and
 		// 1440 are quality, 1080 performance, the output's own DLAA.
 		const double    share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
@@ -2209,7 +2213,9 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 		feature.output_height  = inputs.output.extent.height;
 		feature.quality        = share >= 0.95 ? 0 : share >= 0.62 ? 1 : share >= 0.55 ? 2 : share >= 0.45 ? 3 : 4;
 		feature.depth_inverted = 1;
-		feature.hdr            = 1; // (the game's linear HDR scene, before its tone mapping; automatic exposure)
+		// (The game's linear HDR scene, before its tone mapping, with automatic exposure; the late upscale's finished frame
+		// is tone-mapped.)
+		feature.hdr            = inputs.hdr ? 1 : 0;
 		// KYTY_DLSS_PRESET=<letter> (a test): that DLSS model for every mode instead of the mode's default.
 		if (const char* preset = std::getenv("KYTY_DLSS_PRESET"); preset != nullptr && *preset >= 'A' && *preset <= 'O')
 			feature.preset = static_cast<uint32_t>(*preset - 'A' + 1);
@@ -2227,6 +2233,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 		created        = true;
 		created_render = inputs.color.extent;
 		created_output = inputs.output.extent;
+		created_hdr    = inputs.hdr;
 	}
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();

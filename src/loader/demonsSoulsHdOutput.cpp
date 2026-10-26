@@ -33,7 +33,8 @@ void Nop(uint64_t address, uint32_t length) {
 uint32_t CustomOutputHeight() {
 	static const uint32_t height = [] {
 		const char* value = std::getenv("KYTY_OUTPUT_HEIGHT");
-		if (value == nullptr || *value == 0) return 0u;
+		// (The late upscale's output, not the PS5 Pro path's: DemonsSoulsSuperResolution::LateOutputHeight.)
+		if (value == nullptr || *value == 0 || DemonsSoulsSuperResolution::LateRequested()) return 0u;
 		const auto parsed = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
 		if (parsed == DemonsSoulsRenderSize::OutputHeight) return 0u;
 		if (parsed < HdHeight || parsed > DemonsSoulsRenderSize::OutputHeight) {
@@ -46,10 +47,14 @@ uint32_t CustomOutputHeight() {
 }
 
 uint32_t UpscaledHeight() {
+	// (The late upscale: the PS5 Pro path's output at the render size, the upscale made after the frame.)
+	if (DemonsSoulsSuperResolution::LateRequested()) return DemonsSoulsSuperResolution::LateRenderHeight();
 	return CustomOutputHeight() != 0 ? CustomOutputHeight() : HdHeight;
 }
 
 uint32_t UpscaledWidth() {
+	if (DemonsSoulsSuperResolution::LateRequested())
+		return DemonsSoulsRenderSize::RenderSizeFor(DemonsSoulsSuperResolution::LateRenderHeight()).width;
 	return CustomOutputHeight() != 0 ? DemonsSoulsRenderSize::RenderSizeFor(CustomOutputHeight()).width : HdWidth;
 }
 
@@ -66,6 +71,8 @@ uint32_t WideOutputWidth() {
 }
 
 bool Requested() {
+	// The late upscale (KYTY_UPSCALE_LATE): the PS5 Pro path's output at the render size.
+	if (DemonsSoulsSuperResolution::LateRequested()) return true;
 	// KYTY_OUTPUT_HEIGHT: the PS5 Pro path's output at that height (with an upscaler only: the game's own HD path has no
 	// other size).
 	if (const char* upscaler = std::getenv("KYTY_UPSCALER");
@@ -133,17 +140,23 @@ void Install(Program* program) {
 	// KYTY_OUTPUT_HEIGHT above 1080 (InterfaceAtOutput; KYTY_OUTPUT_LAYOUT=hd: not): the interface's 4K layout at the
 	// output's size, below. With a wider KYTY_RENDER_ASPECT the wide output at that height (WideOutputWidth), the display
 	// buffers as wide: the game copies its output into them for the frames without the 3D (issue #198).
-	const char* layout = std::getenv("KYTY_OUTPUT_LAYOUT");
-	const auto  screen = upscaled && CustomOutputHeight() > HdHeight && (layout == nullptr || std::strcmp(layout, "hd") != 0)
-	                         ? GuestCode::FindUnique(*program, GuestCode::Pattern(ScreenSize))
-	                         : std::nullopt;
+	// The late upscale always (its output at the render size, 720 for 1440: the HD layout's 1080 does not fit it).
+	const char* layout  = std::getenv("KYTY_OUTPUT_LAYOUT");
+	const bool  late    = upscaled && DemonsSoulsSuperResolution::LateRequested();
+	const bool  at_size = late || (upscaled && CustomOutputHeight() > HdHeight &&
+	                               (layout == nullptr || std::strcmp(layout, "hd") != 0));
+	const auto  screen  = at_size ? GuestCode::FindUnique(*program, GuestCode::Pattern(ScreenSize)) : std::nullopt;
 	if (screen) {
 		const char* aspect = std::getenv("KYTY_RENDER_ASPECT");
 		const char* wide   = std::getenv("KYTY_WIDE_OUTPUT");
 		const auto  value  = aspect != nullptr && *aspect != 0 ? DemonsSoulsRenderSize::ParseAspect(aspect) : 0.0;
 		if (value != 0.0 && (wide == nullptr || std::strcmp(wide, "0") != 0))
 			g_wide = DemonsSoulsRenderSize::RenderSizeFor(height, value).width;
-	} else if (upscaled && CustomOutputHeight() > HdHeight && (layout == nullptr || std::strcmp(layout, "hd") != 0)) {
+	} else if (late) {
+		std::printf("Demon's Souls HD output: the interface's screen size not found; the late upscale's %ux%u frame cuts "
+		            "off its HD layout\n",
+		            width, height);
+	} else if (at_size) {
 		std::printf("Demon's Souls HD output: the interface's screen size not found; its HD layout scaled instead\n");
 	}
 	const uint32_t buffer_width = g_wide != 0 ? g_wide : width;
@@ -206,11 +219,12 @@ void Install(Program* program) {
 	g_upscaled = upscaled;
 	SetMode(2);
 	if (upscaled) {
-		std::printf("Demon's Souls HD output: the interface at %s over the PS5 Pro path's %ux%u output%s\n",
+		std::printf("Demon's Souls HD output: the interface at %s over the PS5 Pro path's %ux%u output%s%s\n",
 		            g_layout_4k ? g_wide != 0 ? "the output's 16:9 part (its 4K layout)" : "the output's size (its 4K layout)"
 		                        : "1920x1080 (its HD layout)",
 		            g_wide != 0 ? g_wide : width, height,
-		            CustomOutputHeight() != 0 && !g_layout_4k ? " (KYTY_OUTPUT_HEIGHT; the interface scaled to it)" : "");
+		            CustomOutputHeight() != 0 && !g_layout_4k ? " (KYTY_OUTPUT_HEIGHT; the interface scaled to it)" : "",
+		            late ? " (the late upscale's: the render size)" : "");
 	} else {
 		std::printf("Demon's Souls HD output: the game's HD path (display mode 2: output, post-processing and interface at "
 		            "1920x1080) is on\n");

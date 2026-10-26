@@ -39,6 +39,9 @@
 #   .\run-windows.ps1 -Upscaler dlss -OutputHeight 1440   the upscaler's output (and the frame on it) at 2560x1440
 #                                            instead of 3840x2160, for a 1440p screen (1080-2159; the HUD in its HD
 #                                            layout scaled to it); -RenderHeight picks the mode (1440 DLAA, 960 Quality)
+#   .\run-windows.ps1 -LateUpscale           a late upscale (-Upscaler dlss unless given): the game makes its whole
+#                                            frame - 3D, effects, post-processing, HUD - at 1280x720 (-RenderHeight),
+#                                            then DLSS upscales the finished frame to 2560x1440 (-OutputHeight)
 #   .\run-windows.ps1 -Aspect 21:9           Demon's Souls renders its 3D wider (21:9 = 64:27, up to 32:9; 3416x1440
 #                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD at
 #                                            its sides unstretched; menus and movies stretched, or with -AspectFit
@@ -89,6 +92,7 @@ param(
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
 	[ValidateSet('', 'dlss', 'fsr')][string]$Upscaler = '',
+	[switch]$LateUpscale,
 	[string]$StreamlineDir = '',
 	[switch]$Fsr,
 	[string]$Affinity = '',
@@ -318,6 +322,12 @@ if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # -LowLatency: src/graphics/presentation/videoOut.cpp's FlipQueue (fc1e9cf4).
 if ($LowLatency) { $environment['KYTY_LOW_LATENCY'] = '1' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# -LateUpscale: the upscale after the game's whole frame (KYTY_UPSCALE_LATE, src/loader/demonsSoulsSuperResolution.h,
+# src/local/late-upscale.h), DLSS unless -Upscaler says otherwise.
+if ($LateUpscale) {
+	if (!$Upscaler) { $Upscaler = 'dlss' }
+	$environment['KYTY_UPSCALE_LATE'] = '1'
+}
 # -Upscaler dlss|fsr: src/loader/demonsSoulsSuperResolution.h (fsr: src/local/fsr-native.h).
 if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
 # -Fsr: FSR 3.1 (one generated frame; no Streamline).

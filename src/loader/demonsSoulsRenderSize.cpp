@@ -159,7 +159,9 @@ void Install(Program* program) {
 	const char* setting = std::getenv("KYTY_RENDER_HEIGHT");
 	const char* wide    = std::getenv("KYTY_RENDER_ASPECT");
 	const bool  numeric   = setting != nullptr && *setting != 0 && std::strcmp(setting, "auto") != 0;
-	const auto  automatic = AutoHeight(DemonsSoulsSuperResolution::Active());
+	// (The late upscale, loader/demonsSoulsSuperResolution.h: the output its render height already, not the window's.)
+	const bool  late      = DemonsSoulsSuperResolution::Late();
+	const auto  automatic = late ? 0u : AutoHeight(DemonsSoulsSuperResolution::Active());
 	// (The PS5 Pro path with the HD output always: its 1080p output is made here. The HD output alone always too: its
 	// display mode 1 is, below.)
 	const bool  hd_pro    = DemonsSoulsSuperResolution::Active() && DemonsSoulsSuperResolution::HdOutput();
@@ -179,10 +181,11 @@ void Install(Program* program) {
 	const uint32_t pro_height  = DemonsSoulsHdOutput::UpscaledHeight();
 	const uint32_t out_width   = hd ? DemonsSoulsHdOutput::HdWidth : hd_pro ? pro_width : OutputWidth;
 	const uint32_t out_height  = hd ? DemonsSoulsHdOutput::HdHeight : hd_pro ? pro_height : OutputHeight;
-	auto requested = automatic != 0 ? automatic
-	                 : numeric      ? static_cast<uint32_t>(std::strtoul(setting, nullptr, 10))
-	                 : hd_pro       ? pro_height
-	                                : game_height;
+	auto requested = late             ? pro_height
+	                 : automatic != 0 ? automatic
+	                 : numeric        ? static_cast<uint32_t>(std::strtoul(setting, nullptr, 10))
+	                 : hd_pro         ? pro_height
+	                                  : game_height;
 	if (hd_pro && requested > pro_height) {
 		std::printf("Demon's Souls render size: %u is above the %ux%u output (the upscaler's, KYTY_HD_OUTPUT or "
 		            "KYTY_OUTPUT_HEIGHT); %u instead\n",
@@ -248,7 +251,8 @@ void Install(Program* program) {
 	}
 	// (The HD output's display mode 2, its own 1920x1080 3D, leaves the menus' 3D black - the equipment menu's character,
 	// the character creator, issue #138 - where mode 1 draws it at 900 and 1000 alike: mode 1 makes 1080 too.)
-	if (!hd && requested == game_height && aspect == 0.0) return;
+	// (The PS5 Pro path's smaller output is made below at any render height: hd_pro.)
+	if (!hd && !hd_pro && requested == game_height && aspect == 0.0) return;
 	auto size = RenderSizeFor(requested, aspect != 0.0 ? aspect : GameAspect);
 	if (const auto most = MaxRenderHeight(aspect != 0.0 ? aspect : GameAspect); size.height > most) {
 		const auto lower = RenderSizeFor(most, aspect != 0.0 ? aspect : GameAspect);

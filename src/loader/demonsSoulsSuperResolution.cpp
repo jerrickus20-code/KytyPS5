@@ -1,5 +1,6 @@
 #include "loader/demonsSoulsSuperResolution.h"
 #include "loader/demonsSoulsHdOutput.h"
+#include "loader/demonsSoulsRenderSize.h"
 
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "loader/guestCode.h"
@@ -7,6 +8,7 @@
 #include "local/frame-gen.h"
 #include "local/fsr-native.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +30,52 @@ bool g_hd     = false; // with the HD output (KYTY_HD_OUTPUT): a 1920x1080 outpu
 
 bool Active() {
 	return g_active;
+}
+
+bool LateRequested() {
+	static const bool requested = [] {
+		const char* late     = std::getenv("KYTY_UPSCALE_LATE");
+		const char* upscaler = std::getenv("KYTY_UPSCALER");
+		return late != nullptr && std::strcmp(late, "1") == 0 && upscaler != nullptr && *upscaler != 0 &&
+		       std::strcmp(upscaler, "off") != 0;
+	}();
+	return requested;
+}
+
+bool Late() {
+	// (Its output at the render size is the HD output's places: without them the game's TAA is replaced by a stretch.)
+	return g_active && LateRequested() && DemonsSoulsHdOutput::Active();
+}
+
+uint32_t LateOutputHeight() {
+	static const uint32_t height = [] {
+		constexpr uint32_t fallback = 1440;
+		const char*        value    = std::getenv("KYTY_OUTPUT_HEIGHT");
+		if (value == nullptr || *value == 0) return fallback;
+		const auto parsed = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		if (parsed <= 720 || parsed > DemonsSoulsRenderSize::OutputHeight) {
+			std::printf("Demon's Souls late upscale: KYTY_OUTPUT_HEIGHT=%s is not 721-2160; %u instead\n", value, fallback);
+			return fallback;
+		}
+		return parsed;
+	}();
+	return height;
+}
+
+uint32_t LateRenderHeight() {
+	static const uint32_t height = [] {
+		const uint32_t output  = LateOutputHeight();
+		const char*    setting = std::getenv("KYTY_RENDER_HEIGHT");
+		if (setting == nullptr || *setting == 0 || std::strcmp(setting, "auto") == 0)
+			return std::max(DemonsSoulsRenderSize::LeastRenderHeight, output / 2);
+		const auto parsed = static_cast<uint32_t>(std::strtoul(setting, nullptr, 10));
+		const auto fitted = std::clamp(parsed, DemonsSoulsRenderSize::LeastRenderHeight, output);
+		if (fitted != parsed)
+			std::printf("Demon's Souls late upscale: KYTY_RENDER_HEIGHT=%s is not %u-%u (the late output's); %u instead\n",
+			            setting, DemonsSoulsRenderSize::LeastRenderHeight, output, fitted);
+		return fitted;
+	}();
+	return height;
 }
 
 bool HdOutput() {
@@ -76,6 +124,15 @@ void Install(Program* program) {
 	g_active = true;
 	// (Its 1920x1080 output: DemonsSoulsHdOutput::Install takes the interface's part, DemonsSoulsRenderSize the sizes.)
 	g_hd = DemonsSoulsHdOutput::Requested();
+	if (LateRequested()) {
+		// (The late upscale: the PS5 Pro path's output at the render size, DemonsSoulsHdOutput::UpscaledHeight.)
+		const auto render = DemonsSoulsRenderSize::RenderSizeFor(LateRenderHeight());
+		const auto output = DemonsSoulsRenderSize::RenderSizeFor(LateOutputHeight());
+		std::printf("Demon's Souls super resolution: the PS5 Pro path (display mode 5) with a late upscale: the game's "
+		            "whole frame (3D, effects, post-processing, interface) at %ux%u, then %s to %ux%u at the flip\n",
+		            render.width, render.height, fsr ? "FSR 3" : "DLSS", output.width, output.height);
+		return;
+	}
 	std::printf("Demon's Souls super resolution: the PS5 Pro path (display mode 5, %s in place of the TAA) is on", fsr ? "FSR 3" : "DLSS");
 	if (g_hd)
 		std::printf(", its output %ux%u (%s)", DemonsSoulsHdOutput::UpscaledWidth(), DemonsSoulsHdOutput::UpscaledHeight(),

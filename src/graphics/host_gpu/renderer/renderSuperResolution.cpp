@@ -1,6 +1,7 @@
 // Sony's PS5 Pro super resolution as Demon's Souls dispatches it (graphics/guest_gpu/superResolution.h), done here:
 // DLSS (KYTY_UPSCALER=dlss, frame-gen.h) where Streamline offers it, FSR 3 (KYTY_UPSCALER=fsr, fsr-native.h: Linux,
-// any GPU), else a linear stretch of the input.
+// any GPU), else a linear stretch of the input. With the late upscale (KYTY_UPSCALE_LATE, late-upscale.h) the input
+// passed through at its size instead, its depth, motion and jitter kept for the upscale at the flip.
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/superResolution.h"
@@ -19,6 +20,7 @@
 #include "common/assert.h"
 #include "frame-gen.h"
 #include "fsr-native.h"
+#include "late-upscale.h"
 #include "gpu_tiler_shaders/sr_exposure_spv.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -380,8 +382,11 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		const char* value = std::getenv("KYTY_SR_EXPOSURE");
 		return value == nullptr || *value != '0';
 	}();
-	const bool fsr          = FsrNative::UpscalerRequested() && !stretch;
-	const bool dlss         = FrameGen::UpscalerReady() && !stretch && !fsr;
+	// The late upscale: the output is the input's size, the 3D copied into it (the stretch below), jittered and with its
+	// aliasing, for the game's post-processing and interface; the upscaler runs on the finished frame at the flip.
+	const bool late         = LateUpscale::Active();
+	const bool fsr          = FsrNative::UpscalerRequested() && !stretch && !late;
+	const bool dlss         = FrameGen::UpscalerReady() && !stretch && !fsr && !late;
 	const bool upscaler     = dlss || fsr;
 	// (FSR's backend reads a depth image in the shader-read layout, as the TAA's depth copy is.)
 	const auto depth_layout = depth.info.IsDepth() && !fsr ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
@@ -458,7 +463,8 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		describe("output", output, bindings[3]);
 	}
 	if (static std::atomic<uint32_t> reports {0}; reports.fetch_add(1, std::memory_order_relaxed) < 2) {
-		std::printf("Super resolution: %s, the game's exposure %s\n", dlss ? "DLSS" : fsr ? "FSR 3" : "stretch",
+		std::printf("Super resolution: %s, the game's exposure %s\n",
+		            dlss ? "DLSS" : fsr ? "FSR 3" : late ? "passed through (the late upscale's at the flip)" : "stretch",
 		            record.exposure_pass.pipeline != nullptr ? "applied" : "not applied");
 		std::fflush(stdout);
 	}
@@ -467,6 +473,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		record.timing       = timing;
 		record.timing_entry = static_cast<uint32_t>(timing->written++ % Timing::Entries);
 	}
+	if (late) LateUpscale::Capture(m_context.GetGraphics(), buffer, depth, motion, inputs);
 	if (upscaler) {
 		color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, range(bindings[0]), vk_buffer);
 		motion.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, range(bindings[1]), vk_buffer);
@@ -482,7 +489,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 #endif
 		buffer.InvalidateGraphicsState(); // (what DLSS bound)
 	} else {
-		// No DLSS: the input stretched to the output (no anti-aliasing), then the exposure.
+		// No DLSS: the input stretched to the output (no anti-aliasing), then the exposure (the late upscale: copied).
 		color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range(bindings[0]), vk_buffer);
 		output.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, range(bindings[3]), vk_buffer);
 		vk::ImageBlit blit {};

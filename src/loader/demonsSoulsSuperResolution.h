@@ -21,6 +21,13 @@ struct Program;
 // a lower render height to 1080p, where the game's own HD path has no upscaler (its TAA, bloom and depth of field run
 // at the render size, the final composite stretches them). Its least render height is then the render height itself
 // (SetLeastHeight).
+// KYTY_UPSCALE_LATE=1 (run-windows.ps1 -LateUpscale) with KYTY_UPSCALER: a late upscale. The PS5 Pro path runs with
+// its output at the render size (the HD output's places at KYTY_RENDER_HEIGHT; by default half the late output: 720
+// for 1440), its dispatch passing the jittered 3D through instead of upscaling it (renderSuperResolution.cpp), so that
+// the game's bloom, depth of field, motion blur, its other effects and its interface are all made at the render size.
+// At the guest flip the upscaler then makes the finished frame KYTY_OUTPUT_HEIGHT high (1440 by default: 1280x720 ->
+// 2560x1440) from it and the dispatch's depth, motion vectors and jitter (local/late-upscale.h). Frames without the 3D
+// (movies, menus, loading screens) are stretched to that size.
 namespace DemonsSoulsSuperResolution {
 // Before DemonsSoulsHdOutput::Install, which takes only the interface's part of the HD path when this is on.
 void Install(Program* program);
@@ -28,6 +35,15 @@ void Install(Program* program);
 [[nodiscard]] bool Active();
 // ... with the HD output (KYTY_HD_OUTPUT): a 1920x1080 output.
 [[nodiscard]] bool HdOutput();
+// KYTY_UPSCALE_LATE=1 with an upscaler (KYTY_UPSCALER): before Install, for the other patches.
+[[nodiscard]] bool LateRequested();
+// ... and Install turned the PS5 Pro path on with it, DemonsSoulsHdOutput::Install its output at the render size.
+[[nodiscard]] bool Late();
+// The late upscale's output height: KYTY_OUTPUT_HEIGHT (721-2160), else 1440.
+[[nodiscard]] uint32_t LateOutputHeight();
+// The height the game makes its whole frame at with the late upscale (its 3D, post-processing and interface; the PS5
+// Pro path's output): KYTY_RENDER_HEIGHT (360 to the late output's height), else half the late output's.
+[[nodiscard]] uint32_t LateRenderHeight();
 // The least view height the game's super resolution runs at (its 1080 in SuperResolution::IsEnabled), for a render
 // height below 1080 with the HD output: a constant of its own in the padding after the function, the comparison
 // pointed at it (the game's 1080.0 is shared). False when the function was not found.

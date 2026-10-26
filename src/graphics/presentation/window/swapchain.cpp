@@ -22,6 +22,7 @@
 #include "anti-lag.h"
 #include "fsr-native.h"
 #include "frame-gen-hudless.h"
+#include "late-upscale.h"
 #include "live-counters.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
@@ -69,6 +70,8 @@ struct Presenter::Frame {
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
+	// `source` (transfer-source layout, `extent`) scaled to the frame image (the late upscale's frames).
+	void BlitFrom(CommandBuffer& command, vk::Image source, vk::Extent2D extent);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
 
@@ -300,6 +303,20 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+}
+
+void Presenter::Frame::BlitFrom(CommandBuffer& command_buffer, vk::Image source, vk::Extent2D extent) {
+	command_buffer.EndRendering();
+	auto command = command_buffer.Handle();
+	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(image.extent.width), static_cast<int32_t>(image.extent.height), 1};
+	command.blitImage(source, vk::ImageLayout::eTransferSrcOptimal, image.image, vk::ImageLayout::eTransferDstOptimal, 1, &blit,
+	                  vk::Filter::eLinear);
 	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
 }
 
@@ -1502,9 +1519,23 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
 		default: break;
 	}
-	frame->Configure(m_impl->window.graphic_ctx,
-	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
-	frame->CopyFrom(buffer, image);
+	const vk::Extent2D extent {image.backing.extent.width, image.backing.extent.height};
+	if (LateUpscale::Active()) {
+		// The late upscale (late-upscale.h): the game's finished frame upscaled from its render size with the depth, motion
+		// and jitter of its 3D; a frame without the 3D (a movie, a menu) stretched to the same size.
+		auto* upscaled = LateUpscale::Upscale(m_impl->window.graphic_ctx, buffer, image);
+		frame->Configure(m_impl->window.graphic_ctx, LateUpscale::OutputExtent(extent), frame_format);
+		if (upscaled != nullptr) {
+			frame->BlitFrom(buffer, upscaled->image, {upscaled->extent.width, upscaled->extent.height});
+		} else {
+			buffer.EndRendering();
+			image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, buffer.Handle());
+			frame->BlitFrom(buffer, image.backing.image, extent);
+		}
+	} else {
+		frame->Configure(m_impl->window.graphic_ctx, extent, frame_format);
+		frame->CopyFrom(buffer, image);
+	}
 	frame->scene    = FrameGen::TakeScene();
 	frame->fg.valid = false;
 	if (FrameGen::Enabled()) {

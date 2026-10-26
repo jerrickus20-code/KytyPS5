@@ -163,6 +163,13 @@ scaled down nor the 1080p one scaled up, the HUD and menus in the game's 4K layo
 scaled down; `-Set KYTY_OUTPUT_LAYOUT=hd`: the game's HD layout scaled up, as before). Its render heights:
 1440 = DLAA, 960 = Quality, 840 = Balanced, 720 = Performance, 480 = Ultra Performance. With the game's TAA the
 output stays 4K.
+A late upscale (`run.cmd -LateUpscale`, or `KYTY_UPSCALE_LATE=1` with an upscaler; DLSS unless `-Upscaler fsr`)
+moves the upscaler to the end of the frame: the game makes its whole frame at the render height, 1280x720 by default
+(its 3D without the TAA, the effects, bloom, depth of field, motion blur and the HUD), and DLSS then makes the finished
+frame 2560x1440 (`-OutputHeight`, 1440 by default; `-RenderHeight` another render height, up to the output's). Less
+work for the graphics card than DLSS in place of the TAA, whose effects and HUD run at the output's size, with a
+softer HUD and text (drawn at 720 and upscaled with the rest; fast camera turns can smear it) and effects at 720's
+detail. Movies, menus and loading screens are stretched to that size.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's

@@ -252,10 +252,11 @@ struct Upscaler {
 		static auto& infinite_switch = LiveSwitch::Find("fsr_depth_infinite", 1);
 		static auto& exposure_switch = LiveSwitch::Find("fsr_auto_exposure", 1);
 		const bool   infinite        = infinite_switch.load(std::memory_order_relaxed) != 0;
+		// (The late upscale's finished frame, late-upscale.h, is tone-mapped: neither HDR nor an exposure of its own.)
 		const uint32_t context_flags =
-		    FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE | FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
+		    (inputs.hdr ? FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE : 0u) | FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
 		    (infinite ? FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE : 0u) |
-		    (exposure_switch.load(std::memory_order_relaxed) != 0 ? FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE : 0u);
+		    (inputs.hdr && exposure_switch.load(std::memory_order_relaxed) != 0 ? FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE : 0u);
 		if (created && (render != inputs.color.extent || display != inputs.output.extent || flags != context_flags))
 			Destroy(graphics);
 		if (!created && !Create(graphics, inputs.color.extent, inputs.output.extent, context_flags)) return false;
