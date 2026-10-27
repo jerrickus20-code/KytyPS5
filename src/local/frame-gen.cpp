@@ -332,6 +332,13 @@ struct Api {
 	PFun_slFreeResources*        free_resources      = nullptr; // optional
 };
 Api              g_api;
+// slGetNewFrameToken is not thread safe (Streamline's programming guide), and the present thread, the renderer thread
+// (DLAA, late DLSS, NIS) and, with Reflex, a game thread all call it: one at a time.
+std::mutex       g_token_mutex;
+sl::Result NewFrameToken(sl::FrameToken*& token, uint32_t* index) {
+	std::lock_guard<std::mutex> lock(g_token_mutex);
+	return g_api.get_new_frame_token(token, index);
+}
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
 uint32_t         g_frame_index = 0;
 bool             g_options_set = false;
@@ -356,8 +363,10 @@ bool                  g_nis_ready  = false;
 uint32_t              g_late_height = 0;
 bool                  g_late_ready  = false;
 bool                  g_late_aa     = false; // KYTY_LATE_DLSS_AA=1: no TAA before it; the jitter kept for DLSS
-// Renderer thread: late DLSS's failed evaluations (8: given up), and the TAA passes copied through since it last made a
-// picture (LateUnresolvedLimit: the game's TAA again, rather than a jittered, aliased picture from then on).
+// Renderer thread: late DLSS's failed evaluations in a row (LateFailureLimit: given up; one that succeeds starts the count
+// again - a run of 8 failures spread over 11 minutes had ended it for good, 10-26), and the TAA passes copied through since
+// it last made a picture (LateUnresolvedLimit: the game's TAA again, rather than a jittered, aliased picture from then on).
+constexpr uint32_t    LateFailureLimit = 60;
 uint32_t              g_late_failures   = 0;
 uint32_t              g_late_unresolved = 0;
 constexpr uint32_t    LateUnresolvedLimit = 120;
@@ -1773,7 +1782,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	}
 
 	++g_frame_index;
-	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
+	if (NewFrameToken(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
 		g_token = nullptr;
 		return;
 	}
@@ -2241,7 +2250,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 	static uint32_t frame = 0;
 	++frame;
 	sl::FrameToken* token = nullptr;
-	if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) return false;
+	if (NewFrameToken(token, &frame) != sl::Result::eOk || token == nullptr) return false;
 
 	sl::Constants constants {};
 	Mat4          identity;
@@ -2538,7 +2547,7 @@ bool NisEnabled() {
 bool LateAaEnabled() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// (Not once late DLSS gave up or stopped making pictures: the TAA's copy would be shown jittered and aliased.)
-	return g_ready && g_late_ready && g_late_aa && !g_nis_off.load(std::memory_order_relaxed) && g_late_failures < 8 &&
+	return g_ready && g_late_ready && g_late_aa && !g_nis_off.load(std::memory_order_relaxed) && g_late_failures < LateFailureLimit &&
 	       g_late_unresolved < LateUnresolvedLimit;
 #else
 	return false;
@@ -2623,7 +2632,7 @@ bool Evaluated(sl::Result result) {
 sl::FrameToken* RendererToken() {
 	sl::FrameToken* token = nullptr;
 	uint32_t        index = g_present_index.load(std::memory_order_acquire);
-	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk) return nullptr;
+	if (NewFrameToken(token, &index) != sl::Result::eOk) return nullptr;
 	return token;
 }
 
@@ -3023,7 +3032,7 @@ bool EvaluateDlss(GraphicContext& graphics, vk::CommandBuffer command, const SrI
 	if (Config::HdrEnabled()) {
 		static uint32_t dlaa_frame = 0;
 		uint32_t        index      = ++dlaa_frame;
-		if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk) token = nullptr;
+		if (NewFrameToken(token, &index) != sl::Result::eOk) token = nullptr;
 	} else {
 		token = RendererToken();
 	}
@@ -3297,7 +3306,7 @@ vk::Extent2D  g_late_input {};
 // HDR, no exposure for DLSS. The view to bind in the scene's place (shader-read-only), or null (the game's stretch).
 vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& scene,
                                TextureCache& cache) {
-	if (g_late_failures >= 8 || scene.image == nullptr || scene.view == nullptr) return nullptr;
+	if (g_late_failures >= LateFailureLimit || scene.image == nullptr || scene.view == nullptr) return nullptr;
 	if (!g_sources.valid || !g_camera.valid) return nullptr; // (a menu, a movie: no 3D this frame)
 	const uint32_t height = g_late_height;
 	const uint32_t width  = (height * 16u / 9u + 7u) / 8u * 8u;
@@ -3342,7 +3351,7 @@ vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer comma
 		create.samples       = vk::SampleCountFlagBits::e1;
 		if (!graphics.CreateImage(create, g_late_image)) {
 			std::printf("Late DLSS: cannot allocate the %ux%u output image\n", width, height);
-			g_late_failures = 8;
+			g_late_failures = LateFailureLimit;
 			return nullptr;
 		}
 		vk::ImageViewCreateInfo view_info {};
@@ -3375,7 +3384,7 @@ vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer comma
 		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
 			std::printf("Late DLSS: slDLSSSetOptions failed (%d): the game's TAA and stretch stay\n", static_cast<int>(result));
 			std::fflush(stdout);
-			g_late_failures = 8;
+			g_late_failures = LateFailureLimit;
 			return nullptr;
 		}
 		g_late_input = scene.extent;
@@ -3388,7 +3397,7 @@ vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer comma
 	static uint32_t late_frame = 0;
 	uint32_t        index      = ++late_frame;
 	sl::FrameToken* token      = nullptr;
-	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) return nullptr;
+	if (NewFrameToken(token, &index) != sl::Result::eOk || token == nullptr) return nullptr;
 	auto constants = CameraConstants(g_camera, static_cast<float>(scene.extent.width),
 	                                 static_cast<float>(scene.extent.height), reset);
 	// (Resolved by the TAA or DLAA: no jitter left in it. KYTY_LATE_DLSS_AA: the game's jitter, its TAA not run.)
@@ -3431,13 +3440,20 @@ vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer comma
 	}
 	DirectLayout(command, g_late_image, vk::ImageLayout::eShaderReadOnlyOptimal);
 	if (!Evaluated(result)) {
-		std::printf("Late DLSS: evaluation failed (%d)%s\n", static_cast<int>(result),
-		            ++g_late_failures >= 8 ? ": the game's TAA and stretch stay" : "");
-		std::fflush(stdout);
+		// (The frame's stretch; the next frame tries again. The first 8 and then every 100th are logged.)
+		static uint32_t failed = 0;
+		++g_late_failures;
+		if (++failed <= 8 || failed % 100 == 0 || g_late_failures == LateFailureLimit) {
+			std::printf("Late DLSS: evaluation failed (%d), %u in a row, %u in all%s\n", static_cast<int>(result),
+			            g_late_failures, failed,
+			            g_late_failures >= LateFailureLimit ? ": the game's TAA and stretch stay" : "");
+			std::fflush(stdout);
+		}
 		return nullptr;
 	}
 	g_late_guest_frame = g_guest_frame;
 	g_late_unresolved  = 0;
+	g_late_failures    = 0;
 	if (++g_late_evaluations == 1 || g_late_evaluations == 600) {
 		std::printf("Late DLSS: evaluated %llu time(s)\n", static_cast<unsigned long long>(g_late_evaluations));
 		std::fflush(stdout);
