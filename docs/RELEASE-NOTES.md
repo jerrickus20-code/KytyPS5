@@ -1,3 +1,19 @@
+## This fork: cheats, in-game switches and late DLSS
+
+Built on v20261026 (its notes follow). See README.md, "Late DLSS and the cheat keys".
+
+- **Late DLSS** (`run-latedlss-1440-cheats.cmd`): the 3D at 1280x720 without the game's TAA, its post-processing at
+  720, then one DLSS pass anti-aliases and upscales the finished picture to 2560x1440 before the HUD goes over it.
+  Needs DLSS frame generation (NVIDIA's Streamline runtime). Shift+F6 switches it off to compare.
+- **Late DLSS at a 1440p output**: the game's output is 2560x1440 with it (its HD mode at that size, the HUD in its 4K
+  layout drawn at 1440), not 4K: DLSS's picture reaches the screen without being stretched to 4K and scaled down again,
+  and the 4K composite and HUD are not drawn. `set KYTY_LATE_DLSS_OUTPUT=4k` in the console before the script keeps
+  the 4K output to compare.
+- **In-game switches**, remembered in `_dlss\toggles.txt`: F4 the 30 fps cap, F12 the FPS panel, F6 DLAA, Shift+F6
+  late DLSS. A short note on screen says the new state.
+- **Cheats**: F1-F3, F5, F11 cheat switches (`KYTY_CHEAT_KEYS`) and F10's give items panel (`KYTY_CHEAT_GIVE_SLOT`).
+  Put your cheat files in a `cheats` folder next to the launcher; it runs without them.
+
 ## New in this build
 
 Your precompiled shaders stay valid: the shaders are the same as in v20261023. The precompile only adds the pipelines of

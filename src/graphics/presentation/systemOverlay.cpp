@@ -11,6 +11,7 @@
 #include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
+#include "loader/cheatGiveCore.h"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <vector>
 #include <span>
 #include <string>
 #include <string_view>
@@ -108,7 +110,8 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Error, SaveList };
+enum class OverlayKind : uint8_t { None, Ime, Error, SaveList, GiveItems };
+namespace Give = Loader::CheatGive;
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -137,6 +140,11 @@ bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 		snapshot->session = {OverlayKind::Ime, snapshot->ime.generation};
 		return true;
 	}
+	// (Below the game's own dialogs: one of them over the panel takes the input until it closes.)
+	if (Give::g_panel_open.load()) {
+		snapshot->session = {OverlayKind::GiveItems, Give::g_panel_generation.load()};
+		return true;
+	}
 	snapshot->session = {};
 	return false;
 }
@@ -149,7 +157,9 @@ enum class InputKind : uint8_t {
 	MousePosition,
 	MouseButton,
 	MouseWheel,
-	ResetController
+	ResetController,
+	Key,  // (the give items panel) id: an ImGuiKey or ImGuiMod_*, x: down
+	Char  // id: a character (UTF-32)
 };
 
 struct InputEvent {
@@ -250,6 +260,10 @@ void RefreshVisibility() {
 		capture_keyboard   = (snapshot.ime.disable_device & Ime::DISABLE_DEVICE_EXT_KEYBOARD) == 0;
 		text_input         = capture_keyboard;
 		multiline          = (snapshot.ime.option & Ime::OPTION_MULTILINE) != 0;
+	} else if (snapshot.session.kind == OverlayKind::GiveItems) {
+		capture_controller = true;
+		capture_keyboard   = true;
+		text_input         = true;
 	}
 	const bool was_controller = std::exchange(g_controller_captured, capture_controller);
 	if (capture_controller || was_controller) {
@@ -414,6 +428,48 @@ ImGuiKey ControllerButtonToKey(int button) {
 	}
 }
 
+// The give items panel's keys.
+ImGuiKey SdlKeyToImGui(SDL_Keycode key) {
+	switch (key) {
+		case SDLK_BACKSPACE: return ImGuiKey_Backspace;
+		case SDLK_DELETE: return ImGuiKey_Delete;
+		case SDLK_LEFT: return ImGuiKey_LeftArrow;
+		case SDLK_RIGHT: return ImGuiKey_RightArrow;
+		case SDLK_UP: return ImGuiKey_UpArrow;
+		case SDLK_DOWN: return ImGuiKey_DownArrow;
+		case SDLK_PAGEUP: return ImGuiKey_PageUp;
+		case SDLK_PAGEDOWN: return ImGuiKey_PageDown;
+		case SDLK_HOME: return ImGuiKey_Home;
+		case SDLK_END: return ImGuiKey_End;
+		case SDLK_TAB: return ImGuiKey_Tab;
+		case SDLK_RETURN: return ImGuiKey_Enter;
+		case SDLK_KP_ENTER: return ImGuiKey_KeypadEnter;
+		case SDLK_a: return ImGuiKey_A;
+		case SDLK_c: return ImGuiKey_C;
+		case SDLK_v: return ImGuiKey_V;
+		case SDLK_x: return ImGuiKey_X;
+		case SDLK_z: return ImGuiKey_Z;
+		default: return ImGuiKey_None;
+	}
+}
+
+std::u32string Utf8ToUtf32(std::string_view text) {
+	std::u32string out;
+	for (size_t i = 0; i < text.size();) {
+		const auto c     = static_cast<unsigned char>(text[i]);
+		const int  extra = c < 0x80 ? 0 : (c >> 5) == 6 ? 1 : (c >> 4) == 14 ? 2 : (c >> 3) == 30 ? 3 : -1;
+		if (extra < 0 || i + static_cast<size_t>(extra) >= text.size()) {
+			i++;
+			continue;
+		}
+		char32_t value = extra == 0 ? c : c & (0x3f >> extra);
+		for (int k = 1; k <= extra; k++) value = (value << 6) | (static_cast<unsigned char>(text[i + k]) & 0x3f);
+		out.push_back(value);
+		i += static_cast<size_t>(extra) + 1;
+	}
+	return out;
+}
+
 PFN_vkVoidFunction LoadVulkanFunction(const char* name, void* user_data) {
 	auto& graphics = *static_cast<GraphicContext*>(user_data);
 	return graphics.instance.getProcAddr(name);
@@ -437,6 +493,7 @@ void InitializeSystemOverlayInput() {
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
 	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
 	SaveDialog::SetVisibilityCallback(RefreshVisibility);
+	Give::g_panel_changed = RefreshVisibility;
 	RefreshVisibility();
 }
 
@@ -445,6 +502,7 @@ void ShutdownSystemOverlayInput() {
 	DialogIme::SetVisibilityCallback(nullptr);
 	ErrorDialog::SetVisibilityCallback(nullptr);
 	SaveDialog::SetVisibilityCallback(nullptr);
+	Give::g_panel_changed = nullptr;
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
@@ -475,8 +533,10 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
 	const auto save   = SaveDialog::GetVisualState();
-	return {core.active || dialog.active || error.active || save.active,
-	        core.revision + dialog.revision + error.revision + save.revision};
+	const bool give   = Give::g_panel_open.load();
+	return {core.active || dialog.active || error.active || save.active || give,
+	        core.revision + dialog.revision + error.revision + save.revision + Give::g_panel_generation.load() * 2 +
+	            (give ? 1 : 0) + Give::g_log_revision.load()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -547,6 +607,24 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			}
 			if (button >= 0 && event.key.repeat == 0)
 				QueueInput({InputKind::Button, session, button, event.type == SDL_KEYDOWN ? 1.0f : 0.0f, 0.0f});
+		}
+		return true;
+	}
+	if (keyboard_event && session.kind == OverlayKind::GiveItems) {
+		if (event.type == SDL_TEXTINPUT) {
+			for (const char32_t c: Utf8ToUtf32(event.text.text)) QueueInput({InputKind::Char, session, static_cast<int>(c), 0.0f, 0.0f});
+		} else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
+			const auto sym  = event.key.keysym.sym;
+			const bool down = event.type == SDL_KEYDOWN;
+			if (down && event.key.repeat == 0 && (sym == SDLK_ESCAPE || sym == SDLK_F10)) {
+				Give::SetPanel(false);
+				return true;
+			}
+			const auto mod = static_cast<SDL_Keymod>(event.key.keysym.mod);
+			QueueInput({InputKind::Key, session, ImGuiMod_Ctrl, (mod & KMOD_CTRL) != 0 ? 1.0f : 0.0f, 0.0f});
+			QueueInput({InputKind::Key, session, ImGuiMod_Shift, (mod & KMOD_SHIFT) != 0 ? 1.0f : 0.0f, 0.0f});
+			if (const ImGuiKey key = SdlKeyToImGui(sym); key != ImGuiKey_None)
+				QueueInput({InputKind::Key, session, key, down ? 1.0f : 0.0f, 0.0f});
 		}
 		return true;
 	}
@@ -746,8 +824,22 @@ struct SystemOverlay::Impl {
 				continue;
 			}
 			switch (event.kind) {
+				case InputKind::Key:
+					io.AddKeyEvent(static_cast<ImGuiKey>(event.id), event.x != 0.0f);
+					pad_mode = false;
+					break;
+				case InputKind::Char:
+					io.AddInputCharacter(static_cast<unsigned int>(event.id));
+					pad_mode = false;
+					break;
 				case InputKind::Button: {
 					const bool down = event.x != 0.0f;
+					pad_mode        = true;
+					if (session.kind == OverlayKind::GiveItems && down && event.id == SDL_CONTROLLER_BUTTON_B) {
+						Give::SetPanel(false);
+					}
+					if (event.id == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) io.AddKeyEvent(ImGuiKey_GamepadL1, down);
+					if (event.id == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) io.AddKeyEvent(ImGuiKey_GamepadR1, down);
 					if (session.kind == OverlayKind::SaveList && down && event.id == SDL_CONTROLLER_BUTTON_B) {
 						SaveDialog::HostCancel(session.generation);
 					}
@@ -766,6 +858,7 @@ struct SystemOverlay::Impl {
 				}
 				case InputKind::Axis: {
 					const float value = event.x / (event.x < 0.0f ? 32768.0f : 32767.0f);
+					if (std::abs(value) > 0.5f) pad_mode = true;
 					if (event.id == SDL_CONTROLLER_AXIS_LEFTX) {
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, value < -0.25f,
 						                     std::max(-value, 0.0f));
@@ -783,7 +876,7 @@ struct SystemOverlay::Impl {
 					}
 					break;
 				}
-				case InputKind::MousePosition: io.AddMousePosEvent(event.x, event.y); break;
+				case InputKind::MousePosition: io.AddMousePosEvent(event.x, event.y); pad_mode = false; break;
 				case InputKind::MouseButton: {
 					int button = -1;
 					if (event.id == SDL_BUTTON_LEFT) button = 0;
@@ -1063,6 +1156,165 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+
+	// The give items cheat's panel (F10, loader/cheatGiveCore.h): a search over the item list, a count, Give.
+	void FilterGiveItems(const std::string& name) {
+		const auto key = Give::Lower(Give::Trim(name));
+		if (key == give_query && give_category == give_filtered_category) return;
+		give_query             = key;
+		give_filtered_category = give_category;
+		give_selected          = 0;
+		give_scroll            = true;
+		static constexpr uint32_t categories[4] {Give::Weapons, Give::Armor, Give::Rings, Give::Goods};
+		const auto                words = Give::Words(key);
+		std::vector<const Give::Item*> exact, starts, rest;
+		for (const auto& item: Give::g_items) {
+			if (give_category != 0 && item.category != categories[give_category - 1]) continue;
+			if (!Give::Matches(item, words)) continue;
+			(item.lower == key ? exact : !key.empty() && item.lower.rfind(key, 0) == 0 ? starts : rest).push_back(&item);
+		}
+		give_results = std::move(exact);
+		give_results.insert(give_results.end(), starts.begin(), starts.end());
+		give_results.insert(give_results.end(), rest.begin(), rest.end());
+	}
+
+	void DrawGiveItems(vk::Extent2D extent) {
+		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
+		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
+		auto&        io    = ImGui::GetIO();
+		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display, IM_COL32(0, 0, 0, 110));
+		const ImVec2 size {std::min(640.0f * scale, display.x - 32.0f), std::min(560.0f * scale, display.y - 32.0f)};
+		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+		ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+		if (focus_pending) ImGui::SetNextWindowFocus();
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {20.0f * scale, 16.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8.0f * scale, 8.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {8.0f * scale, 5.0f * scale});
+		ImGui::PushFont(hud_font, 18.0f * scale);
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings;
+		ImGui::Begin("##GiveItems", nullptr, flags);
+		ImGui::PushFont(hud_font, 24.0f * scale);
+		ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "Give items");
+		ImGui::PopFont();
+		ImGui::SameLine();
+		ImGui::TextDisabled("  %zu items", Give::g_items.size());
+
+		// Category: Tab / Shift+Tab, L1 / R1.
+		static constexpr const char* names[5] {"All", "Weapons", "Armor", "Rings", "Items"};
+		const bool shift = io.KeyShift;
+		if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) give_category = (give_category + (shift ? 4 : 1)) % 5;
+		if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) give_category = (give_category + 4) % 5;
+		if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) give_category = (give_category + 1) % 5;
+		for (int i = 0; i < 5; i++) {
+			if (i > 0) ImGui::SameLine();
+			const bool current = i == give_category;
+			if (current) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.30f, 0.50f, 0.05f, 1.0f});
+			if (ImGui::Button(names[i], {0.0f, 0.0f})) give_category = i;
+			if (current) ImGui::PopStyleColor();
+		}
+
+		// The search: typing always goes there (unless the count is being edited or the pad was used last).
+		ImGui::SetNextItemWidth(-1.0f);
+		if (focus_pending || (!pad_mode && !ImGui::IsAnyItemActive())) ImGui::SetKeyboardFocusHere();
+		const bool entered = ImGui::InputTextWithHint("##GiveSearch", "Type a name - e.g. pure blade x3, dragon bone+4",
+		                                             give_search, sizeof(give_search),
+		                                             ImGuiInputTextFlags_EnterReturnsTrue);
+		std::string name;
+		uint32_t    suffix_count = static_cast<uint32_t>(give_count);
+		Give::SplitCount(give_search, &name, &suffix_count);
+		const bool has_suffix = name != Give::Trim(give_search);
+		FilterGiveItems(name);
+
+		// Up / Down: the item; Page Up / Page Down: the count.
+		const int results = static_cast<int>(give_results.size());
+		if (!pad_mode && results > 0) {
+			const int before = give_selected;
+			if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) give_selected = std::min(give_selected + 1, results - 1);
+			if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) give_selected = std::max(give_selected - 1, 0);
+			if (before != give_selected) give_scroll = true;
+		}
+		if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) give_count = std::min(give_count + 1, 99);
+		if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) give_count = std::max(give_count - 1, 1);
+		give_selected = std::clamp(give_selected, 0, std::max(results - 1, 0));
+
+		const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f + ImGui::GetTextLineHeightWithSpacing() * 4.0f;
+		ImGui::BeginChild("##GiveResults", {0.0f, -footer}, true);
+		std::optional<int> give_now;
+		ImGuiListClipper   clipper;
+		clipper.Begin(results);
+		if (give_scroll && results > 0) clipper.IncludeItemByIndex(give_selected);
+		while (clipper.Step()) {
+			for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+				const auto* item = give_results[static_cast<size_t>(i)];
+				ImGui::PushID(i);
+				const float row_left = ImGui::GetCursorPosX();
+				if (ImGui::Selectable(item->name.c_str(), i == give_selected, ImGuiSelectableFlags_AllowDoubleClick)) {
+					give_selected = i;
+					if (pad_mode || ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) give_now = i;
+				}
+				if (i == give_selected && give_scroll) {
+					ImGui::SetScrollHereY(0.5f);
+					give_scroll = false;
+				}
+				ImGui::SameLine(row_left + ImGui::GetContentRegionAvail().x - 70.0f * scale);
+				ImGui::TextDisabled("%s", Give::CategoryName(item->category));
+				ImGui::PopID();
+			}
+		}
+		if (results == 0) ImGui::TextDisabled(Give::g_items.empty() ? "No item list" : "No item has that name");
+		ImGui::EndChild();
+
+		// Count, Give, give.txt, Close.
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted("Count");
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(170.0f * scale);
+		ImGui::SliderInt("##GiveCount", &give_count, 1, 99, has_suffix ? "(x in the name)" : "%d");
+		for (const int preset: {1, 5, 10, 99}) {
+			ImGui::SameLine();
+			ImGui::PushID(preset);
+			if (ImGui::Button(("x" + std::to_string(preset)).c_str())) give_count = preset;
+			ImGui::PopID();
+		}
+		const uint32_t count = has_suffix ? suffix_count : static_cast<uint32_t>(std::clamp(give_count, 1, 99));
+		const bool     can_give = results > 0;
+		std::string    label    = can_give ? "Give " + give_results[static_cast<size_t>(give_selected)]->name +
+		                                    (count > 1 ? " x" + std::to_string(count) : std::string {})
+		                                  : std::string("Give");
+		ImGui::BeginDisabled(!can_give);
+		if (ImGui::Button((label + "##GiveNow").c_str(), {std::min(ImGui::CalcTextSize(label.c_str()).x + 24.0f * scale, size.x * 0.6f), 0.0f}))
+			give_now = give_selected;
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		if (ImGui::Button("Give give.txt")) Give::Queue({{}, 1, true});
+		ImGui::SameLine();
+		const bool close = ImGui::Button("Close");
+		if (entered && can_give) give_now = give_selected;
+		if (give_now && *give_now >= 0 && *give_now < results) {
+			Give::Queue({*give_results[static_cast<size_t>(*give_now)], count, false});
+		}
+
+		// The last results and the keys.
+		{
+			std::scoped_lock lock {Give::g_mutex};
+			const int pending = Give::g_pending.load();
+			if (pending > 0) ImGui::TextColored({1.0f, 0.8f, 0.3f, 1.0f}, "Giving... (%d waiting)", pending);
+			size_t shown = 0;
+			for (auto line = Give::g_log.rbegin(); line != Give::g_log.rend() && shown < (pending > 0 ? 1u : 2u); ++line, ++shown)
+				ImGui::TextColored(shown == 0 ? ImVec4 {1, 1, 1, 0.9f} : ImVec4 {1, 1, 1, 0.5f}, "%s", line->c_str());
+		}
+		ImGui::PushFont(hud_font, 14.0f * scale);
+		ImGui::TextDisabled(pad_mode ? "Cross: give   D-pad: move   L1 / R1: category   Circle: close"
+		                             : "Enter: give   Up / Down: item   PgUp / PgDn: count   Tab: category   Esc / F10: close");
+		ImGui::PopFont();
+		focus_pending = false;
+		ImGui::End();
+		ImGui::PopFont();
+		ImGui::PopStyleVar(3);
+		if (close) Give::SetPanel(false);
+	}
+
 	// KYTY_FPS_HUD: the frame-time graph (the frames green, hitches red; the render thread's busy part of each
 	// orange; lines at 60 and 30 fps) and the detailed panel's rows with the processor's cores as bars.
 	void DrawPerf(const SystemOverlayPerf& perf, float unit) {
@@ -1241,6 +1493,7 @@ struct SystemOverlay::Impl {
 		                     : std::clamp(std::chrono::duration<float>(now - last_frame).count(),
 		                                  1.0f / 1000.0f, 0.1f);
 		last_frame     = now;
+		io.MouseDrawCursor = dialog && snapshot.session.kind == OverlayKind::GiveItems; // (the game hides the system's)
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
 		if (dialog && (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
@@ -1255,6 +1508,8 @@ struct SystemOverlay::Impl {
 				DrawError(snapshot.error, frame_extent);
 			} else if (snapshot.session.kind == OverlayKind::SaveList) {
 				DrawSaveList(snapshot.save, frame_extent);
+			} else if (snapshot.session.kind == OverlayKind::GiveItems) {
+				DrawGiveItems(frame_extent);
 			} else {
 				DrawIme(snapshot.ime, frame_extent);
 			}
@@ -1312,6 +1567,16 @@ struct SystemOverlay::Impl {
 	ImVec2                                right_stick {};
 	OverlaySession                        session;
 	vk::Extent2D                          extent {};
+	// The give items panel.
+	bool                                  pad_mode = false; // (the pad used last: no keyboard focus kept on the search)
+	char                                  give_search[128] {};
+	int                                   give_category = 0; // 0: all, 1..4: weapons, armor, rings, items
+	int                                   give_count    = 1;
+	int                                   give_selected = 0;
+	bool                                  give_scroll   = false;
+	std::string                           give_query    = "\x01";
+	int                                   give_filtered_category = -1;
+	std::vector<const Give::Item*>        give_results;
 	std::chrono::steady_clock::time_point last_frame;
 };
 

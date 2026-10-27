@@ -38,6 +38,7 @@
 #include "device-fault.h"
 #include "frame-capture.h"
 #include "frame-gen.h"
+#include "common/emulatorConfig.h"
 #include "frame-gen-hudless.h"
 #include "native-preparation-state.h"
 #include "slow-log.h"
@@ -1600,6 +1601,57 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (bindings.pixel.has_value()) {
 		if (set_auto_debug) {
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
+		}
+	}
+	// KYTY_NIS: the final composite reads the render-size picture scaled by NIS (an image of its own).
+	// (HDR runs: the HDR composites too, FrameGen::NisHdrCompositeSlot, and a draw into the output that samples the
+	// picture NIS takes is logged, its shader's hash and slot for KYTY_NIS_SHADERS.)
+	const int nis_slot = FrameGen::NisEnabled() && bindings.pixel && state.ps_active &&
+	                             state.ps_input_info.stage.program != nullptr
+	                         ? FrameGen::NisCompositeSlot(state.ps_input_info.stage.program->shader_hash)
+	                         : -1;
+	if (nis_slot < 0 && FrameGen::NisEnabled() && Config::HdrEnabled() && bindings.pixel && state.ps_active &&
+	    state.ps_input_info.stage.program != nullptr && state.color_count != 0) {
+		static std::atomic<uint32_t> logged {0};
+		const auto scene  = FrameGen::NisSceneExtent();
+		const auto target = state.color_info[0].Extent();
+		if (scene.height != 0 && target.height >= scene.height * 2 && logged.load(std::memory_order_relaxed) < 8) {
+			for (size_t i = 0; i < bindings.pixel->images.size(); ++i) {
+				const auto& image = m_context.GetTextureCache().GetImage(bindings.pixel->images[i].image_id);
+				if (image.info.IsDepth() || image.backing.extent.width != scene.width ||
+				    image.backing.extent.height != scene.height)
+					continue;
+				static std::mutex                   seen_mutex;
+				static std::unordered_set<uint64_t> seen;
+				const uint64_t hash = state.ps_input_info.stage.program->shader_hash;
+				std::scoped_lock                    lock {seen_mutex};
+				if (seen.insert(hash ^ (uint64_t {i} << 56u)).second && logged.fetch_add(1) < 8) {
+					std::printf("NIS (HDR): pixel shader 0x%016llx draws into a %ux%u target from the %ux%u picture in "
+					            "slot %zu, not hooked (KYTY_NIS_SHADERS=%016llx:%zu would)\n",
+					            static_cast<unsigned long long>(hash), target.width, target.height, scene.width,
+					            scene.height, i, static_cast<unsigned long long>(hash), i);
+					std::fflush(stdout);
+				}
+				break;
+			}
+		}
+	}
+	if (nis_slot >= 0 && bindings.pixel->images.size() > static_cast<size_t>(nis_slot)) {
+		auto& binding = bindings.pixel->images[static_cast<size_t>(nis_slot)];
+		auto& image   = m_context.GetTextureCache().GetImage(binding.image_id);
+		if (!image.info.IsDepth() && binding.image_view != nullptr) {
+			buffer.EndRendering();
+			image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, std::nullopt,
+			              buffer.Handle());
+			const FrameGen::SrImage scene {image.backing.image, binding.image_view, image.backing.format,
+			                               {image.backing.extent.width, image.backing.extent.height},
+			                               image.backing.state.layout, image.backing.usage};
+			if (const auto scaled = FrameGen::EvaluateNis(m_context.GetGraphics(), buffer.Handle(), scene,
+			                                                 &m_context.GetTextureCache());
+			    scaled != nullptr) {
+				binding.image_view = scaled;
+				binding.mip_views.clear();
+			}
 		}
 	}
 	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};

@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "frame-gen.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -492,12 +493,9 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 // sceVideoOutSetFlipRate (flips only on every 2nd vblank), a late frame waits for the next vblank,
 // not for the next even one (50 ms, not 67). Movies advance a frame per flip (the intro played at
 // half speed): only frames of the game's 3D view are capped (Presenter::FlipRateApplies).
+// F4 in the game switches it (frame-gen.h FrameGen::FlipRateFloor: KYTY_FLIP_RATE, then the switch).
 static int FlipRateFloor() {
-	static const int floor = [] {
-		const char* value = std::getenv("KYTY_FLIP_RATE");
-		return std::clamp(value != nullptr ? std::atoi(value) : 0, 0, 2);
-	}();
-	return floor;
+	return Libs::Graphics::FrameGen::FlipRateFloor();
 }
 
 // Above 60 Hz (-Fps120): at least vblank/60 vblanks between the flips of frames without the game's 3D view

@@ -79,6 +79,10 @@ void MakeCriticalThread();
 
 // The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).
 int DisplayRefreshHz(void* window);
+// KYTY_RETURN_FOCUS=<window handle> (the launcher's --play: the window that had the focus as it started, Steam's Big
+// Picture when Steam starts the game): the focus handed to that window and `window` (the game's, its HWND) hidden, as
+// the game quits (issue #217). Windows only.
+void ReturnFocus(void* window);
 // Vertical blanks of that display, counted by a thread of their own that waits for each (Windows:
 // D3DKMTWaitForVerticalBlankEvent on the window's display, again when the window moves to another one); a window
 // passed again replaces the first. false where there are none.

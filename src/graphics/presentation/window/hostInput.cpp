@@ -174,10 +174,13 @@ public:
 				}
 			}
 
-			// The emulator's own keys: F7 the mouse camera, F8 its overlay, F9 a debug snapshot, F11 full screen.
+			// The emulator's own keys: F4 the 30 fps cap, F6 DLSS (Shift+F6 late DLSS / NIS), F7 the mouse camera, F8 its
+			// overlay, F9 a debug snapshot, F11 full screen, F12 the FPS panel (window.cpp). (F1-F3, F5, F10 and F11 are
+			// the cheats' only when KYTY_CHEAT_KEYS / KYTY_CHEAT_GIVE_SLOT set them up.)
 			// (Space pauses unless a mapping takes it, the Pause key then; the system's dialogs see Esc first.)
-			const bool reserved = binding.key == SDLK_F7 || binding.key == SDLK_F8 || binding.key == SDLK_F9 ||
-			                      binding.key == SDLK_F11;
+			const bool reserved = binding.key == SDLK_F4 || binding.key == SDLK_F6 || binding.key == SDLK_F7 ||
+			                      binding.key == SDLK_F8 || binding.key == SDLK_F9 || binding.key == SDLK_F11 ||
+			                      binding.key == SDLK_F12;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				// (Skipped, not the end of the start-up: the other mappings still work.)

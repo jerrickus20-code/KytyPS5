@@ -516,10 +516,16 @@ struct Presenter::Impl {
 	}
 
 	[[nodiscard]] SystemOverlayHud* UpdateHud(bool reuse) {
-		const int  level = PerfOverlay::Level();
-		const auto now   = std::chrono::steady_clock::now();
+		// KYTY_FPS_HUD's level (1 frame rate, 2 detailed); F12 shows / hides the panel (shown at level 1 when hidden by
+		// default and F12 pressed).
+		int        level   = PerfOverlay::Level();
+		const bool enabled = FrameGen::HudShown(level != 0);
+		if (enabled && level == 0) level = 1;
+		if (!enabled) level = 0;
+		const auto now = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		if (hud.notice.empty()) hud.notice = FrameGen::HudNotice(); // F1-F6, F10-F12
 		if (level < 2) {
 			// (Switched down from detailed with F8: its rows go.)
 			hud.perf.rows.clear();
@@ -564,13 +570,17 @@ struct Presenter::Impl {
 			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
+			const char* quality = FrameGen::QualityLabel(); // "late DLSS on"
+			const char* sep     = *quality != '\0' ? "  |  " : "";
 			if (presents > 1) {
 				std::snprintf(title.data(), title.size(), "%.0f FPS",
 				              (seconds >= 1.0 ? hud_frames / seconds : game) * presents);
-				std::snprintf(detail.data(), detail.size(), "%s Frame Generation %ux  |  game %.0f fps",
-				              FrameGen::UsesFsr() || FsrNative::InterpolationRequested() ? "FSR 3" : "DLSS", presents, game);
+				std::snprintf(detail.data(), detail.size(), "%s Frame Generation %ux  |  game %.0f fps%s%s",
+				              FrameGen::UsesFsr() || FsrNative::InterpolationRequested() ? "FSR 3" : "DLSS", presents, game,
+				              sep, quality);
 			} else {
 				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
+				if (*quality != '\0') std::snprintf(detail.data(), detail.size(), "%s", quality);
 			}
 			hud.title  = title.data();
 			hud.detail = detail.data();

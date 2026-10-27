@@ -7,12 +7,19 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "loader/demonsSoulsHdOutput.h"
+#include "common/emulatorConfig.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <string_view>
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 #ifndef NOMINMAX
@@ -27,15 +34,26 @@
 #include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_helpers.h>
+#include <sl_nis.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
 #include <cinttypes>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <array>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 #endif
 
 #ifdef KYTY_FRAMEGEN_FSR
@@ -310,8 +328,17 @@ struct Api {
 	PFun_slEvaluateFeature*      evaluate_feature    = nullptr;
 	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
 	PFun_slDLSSGetOptimalSettings* dlss_get_optimal_settings = nullptr;
+	PFun_slNISSetOptions*        nis_set_options     = nullptr;
+	PFun_slFreeResources*        free_resources      = nullptr; // optional
 };
 Api              g_api;
+// slGetNewFrameToken is not thread safe (Streamline's programming guide), and the present thread, the renderer thread
+// (DLAA, late DLSS, NIS) and, with Reflex, a game thread all call it: one at a time.
+std::mutex       g_token_mutex;
+sl::Result NewFrameToken(sl::FrameToken*& token, uint32_t* index) {
+	std::lock_guard<std::mutex> lock(g_token_mutex);
+	return g_api.get_new_frame_token(token, index);
+}
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
 uint32_t         g_frame_index = 0;
 bool             g_options_set = false;
@@ -327,6 +354,51 @@ bool               g_mode_on    = false;
 uint32_t           g_run_with   = 0, g_run_without = 0; // presents in a row with inputs, without them
 // A frame with inputs the presenter left unshown (NoteDroppedFrame): the next one's motion spans two game frames.
 std::atomic<bool>  g_discontinuity {false};
+// KYTY_DLSS / KYTY_NIS (Initialize: requested; OnDevice: available).
+bool                  g_dlss_requested = false, g_dlss_ready = false;
+uint32_t              g_nis_height = 0;
+bool                  g_nis_ready  = false;
+// KYTY_LATE_DLSS=<height> (an experiment): DLSS super resolution of the finished picture (after the game's bloom, depth
+// of field and the rest, at the render size) to <height> lines, in NIS's place before the final composite.
+uint32_t              g_late_height = 0;
+bool                  g_late_ready  = false;
+bool                  g_late_aa     = false; // KYTY_LATE_DLSS_AA=1: no TAA before it; the jitter kept for DLSS
+// Renderer thread: late DLSS's failed evaluations in a row (LateFailureLimit: given up; one that succeeds starts the count
+// again - a run of 8 failures spread over 11 minutes had ended it for good, 10-26), and the TAA passes copied through since
+// it last made a picture (LateUnresolvedLimit: the game's TAA again, rather than a jittered, aliased picture from then on).
+constexpr uint32_t    LateFailureLimit = 60;
+uint32_t              g_late_failures   = 0;
+uint32_t              g_late_unresolved = 0;
+constexpr uint32_t    LateUnresolvedLimit = 120;
+// The full-size TAA pass's depth and motion vectors (OnLateDispatch: indoors the game runs the TAA shader again on a
+// quarter-size lighting buffer, whose images g_sources may hold last).
+struct LateSources {
+	ImageId      depth, motion;
+	uint64_t     depth_address = 0, motion_address = 0;
+	vk::Extent2D extent {};
+};
+LateSources g_late_sources;
+vk::Extent2D g_late_largest {};
+// KYTY_LIVE_FILE switches (LiveCommand): any thread writes, the renderer thread reads.
+std::atomic<bool>     g_dlss_off {false}, g_nis_off {false};
+std::atomic<bool>     g_dlss_options_dirty {false}, g_nis_options_dirty {false};
+std::atomic<int>      g_dlss_auto_exposure {1}, g_dlss_hdr {1};
+// DLSS alpha upscaling (KYTY_DLSS_ALPHA=1 or live `dlssalpha on`; default off: the dark rooms were the exposure).
+std::atomic<int>      g_dlss_alpha {-1};
+// Renderer thread: the DLSS instance's viewport. Streamline applies DLSS options only when it creates the instance, so a
+// live option change makes a new one (viewport 3, 4, ...); the old one is freed a few frames later.
+uint32_t              g_dlss_viewport_id = 11, g_dlss_free_id = 0; // (the super resolution path's DLSS is viewport 1)
+// The exposure pass after DLSS (live `dlssexposure on|off`, `taaalpha keep|<value>`, `exposurescale <x>`).
+std::atomic<bool>     g_exposure_on {true};
+std::atomic<int>      g_taa_alpha_mode {0};
+std::atomic<float>    g_taa_alpha_value {4.0f};
+std::atomic<float>    g_exposure_scale {1.0f};
+uint64_t              g_dlss_evaluations = 0, g_dlss_free_at = 0;
+std::atomic<int>      g_nis_hdr {-1};           // -1: KYTY_NIS_HDR (default none)
+std::atomic<int>      g_nis_sharpness_x100 {-1}; // -1: KYTY_NIS_SHARPNESS (default 0.30)
+// The index of the frame the present thread presents last: the renderer thread's Streamline calls use its token
+// (the same index: the same token object; viewports 1 and 2 keep their constants and tags apart from DLSS-G's 0).
+std::atomic<uint32_t> g_present_index {0};
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
 using Mat4 = sl::float4x4;
@@ -444,10 +516,31 @@ void LogMessage(sl::LogType type, const char* message) {
 		g_dlss_refusals.fetch_add(1, std::memory_order_relaxed);
 	// KYTY_FRAMEGEN_VERBOSE: every message on stdout (the run log), not only errors.
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
-	if (type == sl::LogType::eError || verbose) {
-		std::printf("Streamline %s: %s", type == sl::LogType::eError ? "error" : "log", message);
-		std::fflush(stdout);
+	if (type != sl::LogType::eError && !verbose) return;
+	// The same message again and again (e.g. a frame's constants set twice): the first one, then a count every
+	// 1000, so the console (slow to print to) stays quiet. The key is the text after the [time][tid] prefix.
+	std::string_view key = message != nullptr ? message : "";
+	while (!key.empty() && key.front() == '[') {
+		const auto close = key.find(']');
+		if (close == std::string_view::npos) break;
+		key.remove_prefix(close + 1);
 	}
+	static std::mutex                                mutex;
+	static std::unordered_map<std::string, uint64_t> seen;
+	uint64_t                                         count = 0;
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		count = ++seen[std::string(key)];
+	}
+	if (count == 1) {
+		std::printf("Streamline %s: %s", type == sl::LogType::eError ? "error" : "log", message);
+	} else if (count % 1000 == 0) {
+		std::printf("Streamline %s (%llu times so far, repeats not shown): %.*s", type == sl::LogType::eError ? "error" : "log",
+		            static_cast<unsigned long long>(count), static_cast<int>(key.size()), key.data());
+	} else {
+		return;
+	}
+	std::fflush(stdout);
 }
 
 template <typename F>
@@ -1247,7 +1340,12 @@ void BypassCommandHooks(vk::Device device) {
 #endif
 }
 
+namespace {
+void LoadToggles(); // the in-game switches (below)
+} // namespace
+
 void Initialize() {
+	LoadToggles();
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
 	const char* upscaler = std::getenv("KYTY_UPSCALER");
@@ -1398,6 +1496,34 @@ void Initialize() {
 		if (text.find("pcl") != std::string::npos) features.push_back(sl::kFeaturePCL);
 	}
 	if (g_upscale) features.push_back(sl::kFeatureDLSS);
+	if (const char* dlss = std::getenv("KYTY_DLSS"); dlss != nullptr && std::atoi(dlss) > 0) g_dlss_requested = true;
+	if (const char* nis = std::getenv("KYTY_NIS"); nis != nullptr) {
+		const int height = std::atoi(nis);
+		if (height >= 720 && height <= 2160) g_nis_height = static_cast<uint32_t>(height);
+	}
+	if (const char* late = std::getenv("KYTY_LATE_DLSS"); late != nullptr) {
+		const int height = std::atoi(late);
+		if (height >= 720 && height <= 2160) g_late_height = static_cast<uint32_t>(height);
+	}
+	if (const char* aa = std::getenv("KYTY_LATE_DLSS_AA"); aa != nullptr && aa[0] == '1') g_late_aa = true;
+	// (DLAA and NIS work on the game's own TAA and 4K composite: the super resolution path replaces both.)
+	if ((g_dlss_requested || g_nis_height != 0 || g_late_height != 0) && (g_upscale || g_generate == 0)) {
+		std::printf("Frame generation: KYTY_DLSS / KYTY_NIS / KYTY_LATE_DLSS ignored (%s)\n",
+		            g_upscale ? "the super resolution path (KYTY_UPSCALER=dlss) is on" : "they need frame generation");
+		g_dlss_requested = false;
+		g_nis_height     = 0;
+		g_late_height    = 0;
+	}
+	if ((g_dlss_requested || g_nis_height != 0 || g_late_height != 0) &&
+	    !load(g_api.evaluate_feature, "slEvaluateFeature")) {
+		LOGF("frame generation: sl.interposer.dll lacks slEvaluateFeature\n");
+		g_dlss_requested = false;
+		g_nis_height     = 0;
+		g_late_height    = 0;
+	}
+	if (g_dlss_requested && !load(g_api.free_resources, "slFreeResources")) g_api.free_resources = nullptr;
+	if ((g_dlss_requested || g_late_height != 0) && !g_upscale) features.push_back(sl::kFeatureDLSS);
+	if (g_nis_height != 0) features.push_back(sl::kFeatureNIS);
 	sl::Preferences           preferences {};
 	preferences.showConsole        = false;
 	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") ? sl::LogLevel::eVerbose
@@ -1581,6 +1707,32 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	InitializeHudless();
 	LOGF("frame generation: DLSS-G ready\n");
 	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
+	const auto feature_ready = [&](sl::Feature feature, const char* name) {
+		bool feature_loaded = false;
+		if (g_api.is_feature_supported(feature, adapter) != sl::Result::eOk ||
+		    g_api.is_feature_loaded(feature, feature_loaded) != sl::Result::eOk || !feature_loaded) {
+			std::printf("Frame generation: %s is not available on this device\n", name);
+			return false;
+		}
+		return true;
+	};
+	if ((g_dlss_requested || g_late_height != 0) && feature_ready(sl::kFeatureDLSS, "DLSS") &&
+	    FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_api.dlss_set_options)) {
+		g_dlss_ready = g_dlss_requested;
+		g_late_ready = g_late_height != 0;
+		if (g_dlss_ready) std::printf("Frame generation: DLSS (DLAA) replaces the game's TAA\n");
+		if (g_late_ready)
+			std::printf("Frame generation: late DLSS: the finished picture upscaled by DLSS to %u lines before the final "
+			            "composite (KYTY_LATE_DLSS; Shift+F6 on/off)%s\n",
+			            g_late_height,
+			            g_late_aa ? "; the game's TAA not run, DLSS anti-aliases the jittered picture (KYTY_LATE_DLSS_AA)"
+			                      : "");
+	}
+	if (g_nis_height != 0 && feature_ready(sl::kFeatureNIS, "NIS") &&
+	    FeatureFunction(sl::kFeatureNIS, "slNISSetOptions", g_api.nis_set_options)) {
+		g_nis_ready = true;
+		std::printf("Frame generation: NIS scales the picture to %u lines before the final composite\n", g_nis_height);
+	}
 	std::fflush(stdout);
 #endif
 }
@@ -1630,10 +1782,11 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	}
 
 	++g_frame_index;
-	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
+	if (NewFrameToken(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
 		g_token = nullptr;
 		return;
 	}
+	g_present_index.store(g_frame_index, std::memory_order_release);
 	auto& token = *g_token;
 	// The frame's Reflex sleep, then its markers (all at its present: the game's frame was made before).
 	if (g_api.reflex_sleep != nullptr && kyty_local_framegen_sleep.load(std::memory_order_relaxed) != 0)
@@ -1915,6 +2068,21 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
 	g_sources = {depth, motion, depth_address, motion_address, true};
 }
 
+void OnLateDispatch(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address, vk::Extent2D extent) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_late_ready) return;
+	if (uint64_t {extent.width} * extent.height > uint64_t {g_late_largest.width} * g_late_largest.height)
+		g_late_largest = extent;
+	if (extent == g_late_largest) g_late_sources = {depth, motion, depth_address, motion_address, extent};
+#else
+	(void)depth;
+	(void)depth_address;
+	(void)motion;
+	(void)motion_address;
+	(void)extent;
+#endif
+}
+
 void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address) {
 	g_sources = {depth, motion, depth_address, motion_address, true};
 }
@@ -2082,7 +2250,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs, const vk::d
 	static uint32_t frame = 0;
 	++frame;
 	sl::FrameToken* token = nullptr;
-	if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) return false;
+	if (NewFrameToken(token, &frame) != sl::Result::eOk || token == nullptr) return false;
 
 	sl::Constants constants {};
 	Mat4          identity;
@@ -2314,6 +2482,1381 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 	}
 	DestroyHudlessInputs(graphics, inputs);
 	inputs.valid = false;
+}
+
+// ---- KYTY_DLSS (DLAA in place of the TAA) and KYTY_NIS (scaling before the final composite) ----
+
+bool DlssEnabled() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return g_ready && g_dlss_ready && !g_dlss_off.load(std::memory_order_relaxed);
+#else
+	return false;
+#endif
+}
+
+bool NisAvailable() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return g_ready && (g_nis_ready || g_late_ready);
+#else
+	return false;
+#endif
+}
+
+namespace {
+std::atomic<uint64_t> g_nis_scene_extent {0}; // width << 32 | height
+} // namespace
+
+vk::Extent2D NisSceneExtent() {
+	const uint64_t packed = g_nis_scene_extent.load(std::memory_order_relaxed);
+	return {static_cast<uint32_t>(packed >> 32u), static_cast<uint32_t>(packed & 0xffffffffu)};
+}
+
+int NisHdrCompositeSlot(uint64_t pixel_shader) {
+	if (!Config::HdrEnabled()) return -1;
+	static const std::vector<std::pair<uint64_t, int>> composites = [] {
+		std::vector<std::pair<uint64_t, int>> list {{0x3359df0b33704924ULL, 1}};
+		if (const char* value = std::getenv("KYTY_NIS_SHADERS"); value != nullptr) {
+			std::string_view text = value;
+			while (!text.empty()) {
+				const auto comma = text.find(',');
+				const auto item  = std::string(text.substr(0, comma));
+				text             = comma == std::string_view::npos ? std::string_view {} : text.substr(comma + 1);
+				const auto colon = item.find(':');
+				const uint64_t hash = std::strtoull(item.c_str(), nullptr, 16);
+				const int      slot = colon != std::string::npos ? std::atoi(item.c_str() + colon + 1) : 1;
+				if (hash != 0 && slot >= 0 && slot < 16) list.emplace_back(hash, slot);
+			}
+		}
+		std::printf("Frame generation: NIS in HDR takes %zu more composite shader(s) (KYTY_NIS_SHADERS)\n", list.size());
+		std::fflush(stdout);
+		return list;
+	}();
+	for (const auto& [hash, slot]: composites)
+		if (hash == pixel_shader) return slot;
+	return -1;
+}
+
+bool NisEnabled() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return g_ready && (g_nis_ready || g_late_ready) && !g_nis_off.load(std::memory_order_relaxed);
+#else
+	return false;
+#endif
+}
+
+bool LateAaEnabled() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (Not once late DLSS gave up or stopped making pictures: the TAA's copy would be shown jittered and aliased.)
+	return g_ready && g_late_ready && g_late_aa && !g_nis_off.load(std::memory_order_relaxed) && g_late_failures < LateFailureLimit &&
+	       g_late_unresolved < LateUnresolvedLimit;
+#else
+	return false;
+#endif
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+namespace {
+
+// Streamline records into the command buffer on this thread, straight to the driver: the recording worker
+// (KYTY_VULKAN_RECORDING) first records what this thread queued, and the barriers around Streamline's work are
+// recorded directly too (the renderer's barrier dedupe does not see Streamline's work).
+const vk::detail::DispatchLoaderDynamic& Direct() {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	return LocalVulkanRecording::DirectDispatch();
+#else
+	return VULKAN_HPP_DEFAULT_DISPATCHER;
+#endif
+}
+
+// The recording worker's queue played (this thread's commands before Streamline's), and the bound pipelines and dynamic
+// state its draw replays reuse forgotten (Streamline binds its own): what a direct call does (ReplayInline).
+void DrainRecording() {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::ReplayInline([](std::span<const LocalVulkanRecording::Segment>,
+	                                      const vk::detail::DispatchLoaderDynamic&) {},
+	                                   {});
+#endif
+}
+
+void DirectFullBarrier(vk::CommandBuffer command) {
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency, Direct());
+}
+
+void DirectLayout(vk::CommandBuffer command, VulkanImage& image, vk::ImageLayout layout) {
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.oldLayout           = image.state.layout;
+	barrier.newLayout           = layout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image.image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency, Direct());
+	image.state = {vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, layout};
+}
+
+sl::Resource SlResource(const SrImage& image) {
+	sl::Resource resource(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr,
+	                      static_cast<VkImageView>(image.view), static_cast<uint32_t>(image.layout));
+	resource.width        = image.extent.width;
+	resource.height       = image.extent.height;
+	resource.nativeFormat = static_cast<uint32_t>(image.format);
+	resource.mipLevels    = 1;
+	resource.arrayLayers  = 1;
+	resource.flags        = 0;
+	resource.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+	return resource;
+}
+
+// Streamline's evaluation recorded its work: eWarnOutOfVRAM only warns that the video memory budget is exceeded
+// (sl.common checks it after a successful evaluation).
+bool Evaluated(sl::Result result) {
+	return result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM;
+}
+
+// The renderer thread's frame token: the present thread's current index (see g_present_index).
+sl::FrameToken* RendererToken() {
+	sl::FrameToken* token = nullptr;
+	uint32_t        index = g_present_index.load(std::memory_order_acquire);
+	if (NewFrameToken(token, &index) != sl::Result::eOk) return nullptr;
+	return token;
+}
+
+// Constants without a camera (NIS needs none, but each frame's viewport gets a set).
+sl::Constants IdentityConstants() {
+	sl::Constants constants {};
+	Mat4          identity;
+	for (uint32_t i = 0; i < 4; ++i) identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
+	constants.cameraViewToClip          = identity;
+	constants.clipToCameraView          = identity;
+	constants.clipToLensClip            = identity;
+	constants.clipToPrevClip            = identity;
+	constants.prevClipToClip            = identity;
+	constants.jitterOffset              = sl::float2(0.0f, 0.0f);
+	constants.mvecScale                 = sl::float2(1.0f, 1.0f);
+	constants.cameraPinholeOffset       = sl::float2(0.0f, 0.0f);
+	constants.cameraPos                 = sl::float3(0, 0, 0);
+	constants.cameraUp                  = sl::float3(0, 1, 0);
+	constants.cameraRight               = sl::float3(1, 0, 0);
+	constants.cameraFwd                 = sl::float3(0, 0, 1);
+	constants.cameraNear                = 0.1f;
+	constants.cameraFar                 = 10000.0f;
+	constants.cameraFOV                 = 1.0f;
+	constants.cameraAspectRatio         = 16.0f / 9.0f;
+	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
+	constants.depthInverted             = sl::Boolean::eTrue;
+	constants.cameraMotionIncluded      = sl::Boolean::eTrue;
+	constants.motionVectors3D           = sl::Boolean::eFalse;
+	constants.reset                     = sl::Boolean::eFalse;
+	constants.orthographicProjection    = sl::Boolean::eFalse;
+	constants.motionVectorsDilated      = sl::Boolean::eFalse;
+	constants.motionVectorsJittered     = sl::Boolean::eFalse;
+	return constants;
+}
+
+// The same camera, jitter and motion-vector conventions as frame generation's (BeforePresent).
+sl::Constants CameraConstants(const Camera& input, float width, float height, bool reset) {
+	sl::Constants constants = IdentityConstants();
+	constants.reset         = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	const auto camera       = Decompose(input.view_proj);
+	if (!camera.valid) return constants;
+	Mat4 projection;
+	projection[0]              = sl::float4(camera.sx, 0, 0, 0);
+	projection[1]              = sl::float4(0, camera.sy, 0, 0);
+	projection[2]              = sl::float4(camera.cx, camera.cy, 0, 1);
+	projection[3]              = sl::float4(0, 0, camera.z_near, 0);
+	constants.cameraViewToClip = projection;
+	Inverted(projection, constants.clipToCameraView);
+	const auto current  = Transposed(input.view_proj);
+	const auto previous = Transposed(input.prev_view_proj);
+	Mat4       clip_to_world;
+	if (Inverted(current, clip_to_world)) {
+		constants.clipToPrevClip = Multiply(clip_to_world, previous);
+		Inverted(constants.clipToPrevClip, constants.prevClipToClip);
+	}
+	constants.jitterOffset = sl::float2(input.jitter_ndc[0] * width * 0.5f, -input.jitter_ndc[1] * height * 0.5f);
+	// KYTY_DLSS_JITTER_SIGN=-1: the jitter the other way (a comparison).
+	static const float jitter_sign = [] {
+		const char* sign = std::getenv("KYTY_DLSS_JITTER_SIGN");
+		return sign != nullptr && std::atof(sign) < 0 ? -1.0f : 1.0f;
+	}();
+	constants.jitterOffset = sl::float2(constants.jitterOffset.x * jitter_sign, constants.jitterOffset.y * jitter_sign);
+	static const float mv_sign = [] {
+		const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+		return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
+	}();
+	constants.mvecScale         = sl::float2(mv_sign, mv_sign);
+	constants.cameraPos         = camera.position;
+	constants.cameraUp          = camera.up;
+	constants.cameraRight       = camera.right;
+	constants.cameraFwd         = camera.forward;
+	constants.cameraNear        = camera.z_near;
+	constants.cameraFar         = 100000.0f;
+	constants.cameraFOV         = 2.0f * std::atan(1.0f / std::fabs(camera.sy));
+	constants.cameraAspectRatio = std::fabs(camera.sy / camera.sx);
+	return constants;
+}
+
+vk::Extent2D g_dlss_extent {};
+uint64_t     g_dlss_guest_frame = UINT64_MAX; // the guest frame DLSS last ran in
+uint32_t     g_dlss_failures    = 0;
+VulkanImage  g_nis_image;
+vk::ImageView g_nis_view   = nullptr;
+uint32_t      g_nis_failures = 0;
+
+} // namespace
+#endif
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// ---- After DLSS: the game's exposure (its TAA multiplies the color input by it; DLSS does not) ----
+namespace {
+
+// taa_exposure.comp:
+/*
+#version 450
+// After DLSS (in place of Demon's Souls' TAA): the game's TAA multiplies its color input by the eye-adaptation
+// exposure (the first float of a small buffer a pass just before writes on the GPU); DLSS does not, so its result is
+// multiplied here. Alpha: `alpha_mode` 0 keeps DLSS's, 1 writes `alpha_value`.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, rgba16f) uniform image2D picture;
+layout(set = 0, binding = 1, std430) readonly buffer Exposure { float values[]; } exposure;
+layout(push_constant) uniform Push {
+	uint  index;      // the exposure's float index in the bound range
+	uint  width;
+	uint  height;
+	uint  alpha_mode;
+	float alpha_value;
+	float scale;      // an extra factor (1)
+} push;
+void main() {
+	const uvec2 p = gl_GlobalInvocationID.xy;
+	if (p.x >= push.width || p.y >= push.height) return;
+	vec4 c = imageLoad(picture, ivec2(p));
+	c.rgb *= exposure.values[push.index] * push.scale;
+	if (push.alpha_mode == 1u) c.a = push.alpha_value;
+	imageStore(picture, ivec2(p), c);
+}
+*/
+constexpr uint32_t kTaaExposureSpv[] = {
+// glslangValidator -V --target-env vulkan1.3 -Os taa_exposure.comp (frame-gen.cpp)
+0x07230203u, 0x00010600u, 0x0008000bu, 0x00000075u, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
+0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u,
+0x0009000fu, 0x00000005u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000cu, 0x00000017u, 0x00000031u,
+0x0000003au, 0x00060010u, 0x00000004u, 0x00000011u, 0x00000008u, 0x00000008u, 0x00000001u, 0x00030003u,
+0x00000002u, 0x000001c2u, 0x00040005u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x00080005u, 0x0000000cu,
+0x475f6c67u, 0x61626f6cu, 0x766e496cu, 0x7461636fu, 0x496e6f69u, 0x00000044u, 0x00040005u, 0x00000015u,
+0x68737550u, 0x00000000u, 0x00050006u, 0x00000015u, 0x00000000u, 0x65646e69u, 0x00000078u, 0x00050006u,
+0x00000015u, 0x00000001u, 0x74646977u, 0x00000068u, 0x00050006u, 0x00000015u, 0x00000002u, 0x67696568u,
+0x00007468u, 0x00060006u, 0x00000015u, 0x00000003u, 0x68706c61u, 0x6f6d5f61u, 0x00006564u, 0x00060006u,
+0x00000015u, 0x00000004u, 0x68706c61u, 0x61765f61u, 0x0065756cu, 0x00050006u, 0x00000015u, 0x00000005u,
+0x6c616373u, 0x00000065u, 0x00040005u, 0x00000017u, 0x68737570u, 0x00000000u, 0x00040005u, 0x00000031u,
+0x74636970u, 0x00657275u, 0x00050005u, 0x00000038u, 0x6f707845u, 0x65727573u, 0x00000000u, 0x00050006u,
+0x00000038u, 0x00000000u, 0x756c6176u, 0x00007365u, 0x00050005u, 0x0000003au, 0x6f707865u, 0x65727573u,
+0x00000000u, 0x00040047u, 0x0000000cu, 0x0000000bu, 0x0000001cu, 0x00030047u, 0x00000015u, 0x00000002u,
+0x00050048u, 0x00000015u, 0x00000000u, 0x00000023u, 0x00000000u, 0x00050048u, 0x00000015u, 0x00000001u,
+0x00000023u, 0x00000004u, 0x00050048u, 0x00000015u, 0x00000002u, 0x00000023u, 0x00000008u, 0x00050048u,
+0x00000015u, 0x00000003u, 0x00000023u, 0x0000000cu, 0x00050048u, 0x00000015u, 0x00000004u, 0x00000023u,
+0x00000010u, 0x00050048u, 0x00000015u, 0x00000005u, 0x00000023u, 0x00000014u, 0x00040047u, 0x00000031u,
+0x00000021u, 0x00000000u, 0x00040047u, 0x00000031u, 0x00000022u, 0x00000000u, 0x00040047u, 0x00000037u,
+0x00000006u, 0x00000004u, 0x00030047u, 0x00000038u, 0x00000002u, 0x00040048u, 0x00000038u, 0x00000000u,
+0x00000018u, 0x00050048u, 0x00000038u, 0x00000000u, 0x00000023u, 0x00000000u, 0x00030047u, 0x0000003au,
+0x00000018u, 0x00040047u, 0x0000003au, 0x00000021u, 0x00000001u, 0x00040047u, 0x0000003au, 0x00000022u,
+0x00000000u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00040015u, 0x00000006u,
+0x00000020u, 0x00000000u, 0x00040017u, 0x00000007u, 0x00000006u, 0x00000002u, 0x00040017u, 0x0000000au,
+0x00000006u, 0x00000003u, 0x00040020u, 0x0000000bu, 0x00000001u, 0x0000000au, 0x0004003bu, 0x0000000bu,
+0x0000000cu, 0x00000001u, 0x00020014u, 0x0000000fu, 0x0004002bu, 0x00000006u, 0x00000010u, 0x00000000u,
+0x00030016u, 0x00000014u, 0x00000020u, 0x0008001eu, 0x00000015u, 0x00000006u, 0x00000006u, 0x00000006u,
+0x00000006u, 0x00000014u, 0x00000014u, 0x00040020u, 0x00000016u, 0x00000009u, 0x00000015u, 0x0004003bu,
+0x00000016u, 0x00000017u, 0x00000009u, 0x00040015u, 0x00000018u, 0x00000020u, 0x00000001u, 0x0004002bu,
+0x00000018u, 0x00000019u, 0x00000001u, 0x00040020u, 0x0000001au, 0x00000009u, 0x00000006u, 0x0004002bu,
+0x00000006u, 0x00000021u, 0x00000001u, 0x0004002bu, 0x00000018u, 0x00000024u, 0x00000002u, 0x00040017u,
+0x0000002cu, 0x00000014u, 0x00000004u, 0x00090019u, 0x0000002fu, 0x00000014u, 0x00000001u, 0x00000000u,
+0x00000000u, 0x00000000u, 0x00000002u, 0x00000002u, 0x00040020u, 0x00000030u, 0x00000000u, 0x0000002fu,
+0x0004003bu, 0x00000030u, 0x00000031u, 0x00000000u, 0x00040017u, 0x00000034u, 0x00000018u, 0x00000002u,
+0x0003001du, 0x00000037u, 0x00000014u, 0x0003001eu, 0x00000038u, 0x00000037u, 0x00040020u, 0x00000039u,
+0x0000000cu, 0x00000038u, 0x0004003bu, 0x00000039u, 0x0000003au, 0x0000000cu, 0x0004002bu, 0x00000018u,
+0x0000003bu, 0x00000000u, 0x00040020u, 0x0000003eu, 0x0000000cu, 0x00000014u, 0x0004002bu, 0x00000018u,
+0x00000041u, 0x00000005u, 0x00040020u, 0x00000042u, 0x00000009u, 0x00000014u, 0x00040017u, 0x00000046u,
+0x00000014u, 0x00000003u, 0x0004002bu, 0x00000018u, 0x00000052u, 0x00000003u, 0x0004002bu, 0x00000018u,
+0x00000058u, 0x00000004u, 0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u,
+0x00000005u, 0x000300f7u, 0x00000063u, 0x00000000u, 0x000300fbu, 0x00000010u, 0x00000064u, 0x000200f8u,
+0x00000064u, 0x0004003du, 0x0000000au, 0x0000000du, 0x0000000cu, 0x0007004fu, 0x00000007u, 0x0000000eu,
+0x0000000du, 0x0000000du, 0x00000000u, 0x00000001u, 0x00050051u, 0x00000006u, 0x00000013u, 0x0000000du,
+0x00000000u, 0x00050041u, 0x0000001au, 0x0000001bu, 0x00000017u, 0x00000019u, 0x0004003du, 0x00000006u,
+0x0000001cu, 0x0000001bu, 0x000500aeu, 0x0000000fu, 0x0000001du, 0x00000013u, 0x0000001cu, 0x000400a8u,
+0x0000000fu, 0x0000001eu, 0x0000001du, 0x000300f7u, 0x00000020u, 0x00000000u, 0x000400fau, 0x0000001eu,
+0x0000001fu, 0x00000020u, 0x000200f8u, 0x0000001fu, 0x00050051u, 0x00000006u, 0x00000023u, 0x0000000du,
+0x00000001u, 0x00050041u, 0x0000001au, 0x00000025u, 0x00000017u, 0x00000024u, 0x0004003du, 0x00000006u,
+0x00000026u, 0x00000025u, 0x000500aeu, 0x0000000fu, 0x00000027u, 0x00000023u, 0x00000026u, 0x000200f9u,
+0x00000020u, 0x000200f8u, 0x00000020u, 0x000700f5u, 0x0000000fu, 0x00000028u, 0x0000001du, 0x00000064u,
+0x00000027u, 0x0000001fu, 0x000300f7u, 0x0000002au, 0x00000000u, 0x000400fau, 0x00000028u, 0x00000029u,
+0x0000002au, 0x000200f8u, 0x00000029u, 0x000200f9u, 0x00000063u, 0x000200f8u, 0x0000002au, 0x0004003du,
+0x0000002fu, 0x00000032u, 0x00000031u, 0x0004007cu, 0x00000034u, 0x00000035u, 0x0000000eu, 0x00050062u,
+0x0000002cu, 0x00000036u, 0x00000032u, 0x00000035u, 0x00050041u, 0x0000001au, 0x0000003cu, 0x00000017u,
+0x0000003bu, 0x0004003du, 0x00000006u, 0x0000003du, 0x0000003cu, 0x00060041u, 0x0000003eu, 0x0000003fu,
+0x0000003au, 0x0000003bu, 0x0000003du, 0x0004003du, 0x00000014u, 0x00000040u, 0x0000003fu, 0x00050041u,
+0x00000042u, 0x00000043u, 0x00000017u, 0x00000041u, 0x0004003du, 0x00000014u, 0x00000044u, 0x00000043u,
+0x00050085u, 0x00000014u, 0x00000045u, 0x00000040u, 0x00000044u, 0x0008004fu, 0x00000046u, 0x00000048u,
+0x00000036u, 0x00000036u, 0x00000000u, 0x00000001u, 0x00000002u, 0x0005008eu, 0x00000046u, 0x00000049u,
+0x00000048u, 0x00000045u, 0x00050051u, 0x00000014u, 0x0000004cu, 0x00000049u, 0x00000000u, 0x00060052u,
+0x0000002cu, 0x0000006cu, 0x0000004cu, 0x00000036u, 0x00000000u, 0x00050051u, 0x00000014u, 0x0000004eu,
+0x00000049u, 0x00000001u, 0x00060052u, 0x0000002cu, 0x0000006eu, 0x0000004eu, 0x0000006cu, 0x00000001u,
+0x00050051u, 0x00000014u, 0x00000051u, 0x00000049u, 0x00000002u, 0x00060052u, 0x0000002cu, 0x00000070u,
+0x00000051u, 0x0000006eu, 0x00000002u, 0x00050041u, 0x0000001au, 0x00000053u, 0x00000017u, 0x00000052u,
+0x0004003du, 0x00000006u, 0x00000054u, 0x00000053u, 0x000500aau, 0x0000000fu, 0x00000055u, 0x00000054u,
+0x00000021u, 0x000300f7u, 0x00000057u, 0x00000000u, 0x000400fau, 0x00000055u, 0x00000056u, 0x00000057u,
+0x000200f8u, 0x00000056u, 0x00050041u, 0x00000042u, 0x00000059u, 0x00000017u, 0x00000058u, 0x0004003du,
+0x00000014u, 0x0000005au, 0x00000059u, 0x00070050u, 0x0000002cu, 0x00000074u, 0x0000004cu, 0x0000004eu,
+0x00000051u, 0x0000005au, 0x000200f9u, 0x00000057u, 0x000200f8u, 0x00000057u, 0x000700f5u, 0x0000002cu,
+0x00000073u, 0x00000070u, 0x0000002au, 0x00000074u, 0x00000056u, 0x0004003du, 0x0000002fu, 0x0000005du,
+0x00000031u, 0x00040063u, 0x0000005du, 0x00000035u, 0x00000073u, 0x000200f9u, 0x00000063u, 0x000200f8u,
+0x00000063u, 0x000100fdu, 0x00010038u
+};
+
+struct ExposurePass {
+	vk::DescriptorSetLayout              set_layout = nullptr;
+	vk::PipelineLayout                   layout     = nullptr;
+	vk::Pipeline                         pipeline   = nullptr;
+	vk::DescriptorPool                   pool       = nullptr;
+	std::array<vk::DescriptorSet, 16>    sets {}; // a ring: more than the frames in flight
+	uint32_t                             next   = 0;
+	bool                                 failed = false;
+};
+ExposurePass g_exposure_pass;
+
+struct ExposurePush {
+	uint32_t index, width, height, alpha_mode;
+	float    alpha_value, scale;
+};
+
+bool CreateExposurePass(GraphicContext& graphics) {
+	auto& pass = g_exposure_pass;
+	if (pass.pipeline) return true;
+	if (pass.failed) return false;
+	pass.failed        = true;
+	const auto device  = graphics.device;
+	vk::DescriptorSetLayoutBinding bindings[2] {};
+	bindings[0].binding         = 0;
+	bindings[0].descriptorType  = vk::DescriptorType::eStorageImage;
+	bindings[0].descriptorCount = 1;
+	bindings[0].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	bindings[1].binding         = 1;
+	bindings[1].descriptorType  = vk::DescriptorType::eStorageBuffer;
+	bindings[1].descriptorCount = 1;
+	bindings[1].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.bindingCount = 2;
+	set_info.pBindings    = bindings;
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &pass.set_layout) != vk::Result::eSuccess) return false;
+	vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(ExposurePush)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &pass.set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push;
+	if (device.createPipelineLayout(&layout_info, nullptr, &pass.layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize = sizeof(kTaaExposureSpv);
+	module_info.pCode    = kTaaExposureSpv;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = pass.layout;
+	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pass.pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) return false;
+	vk::DescriptorPoolSize sizes[2] {{vk::DescriptorType::eStorageImage, 16}, {vk::DescriptorType::eStorageBuffer, 16}};
+	vk::DescriptorPoolCreateInfo pool_info {};
+	pool_info.maxSets       = 16;
+	pool_info.poolSizeCount = 2;
+	pool_info.pPoolSizes    = sizes;
+	if (device.createDescriptorPool(&pool_info, nullptr, &pass.pool) != vk::Result::eSuccess) return false;
+	std::array<vk::DescriptorSetLayout, 16> layouts {};
+	layouts.fill(pass.set_layout);
+	vk::DescriptorSetAllocateInfo allocate {};
+	allocate.descriptorPool     = pass.pool;
+	allocate.descriptorSetCount = 16;
+	allocate.pSetLayouts        = layouts.data();
+	if (device.allocateDescriptorSets(&allocate, pass.sets.data()) != vk::Result::eSuccess) return false;
+	pass.failed = false;
+	std::printf("Frame generation: DLSS's result gets the game's exposure (the TAA's)\n");
+	std::fflush(stdout);
+	return true;
+}
+
+// Outside rendering, after DLSS wrote `output` (GENERAL): output.rgb *= exposure.
+void ApplyExposure(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& output,
+                   const TaaExposure& exposure) {
+	if (!g_exposure_on.load(std::memory_order_relaxed) || !exposure.buffer || output.view == nullptr ||
+	    output.layout != vk::ImageLayout::eGeneral || output.format != vk::Format::eR16G16B16A16Sfloat) {
+		return;
+	}
+	if (!CreateExposurePass(graphics)) {
+		static bool told = false;
+		if (!told) {
+			told = true;
+			std::printf("Frame generation: the exposure pass could not be created (DLSS's result stays unexposed)\n");
+			std::fflush(stdout);
+		}
+		return;
+	}
+	static bool described = false;
+	if (!described) {
+		described = true;
+		std::printf("Frame generation: exposure from float %u of a %llu-byte range (offset %llu)\n", exposure.index,
+		            static_cast<unsigned long long>(exposure.range), static_cast<unsigned long long>(exposure.offset));
+		std::fflush(stdout);
+	}
+	auto&      pass = g_exposure_pass;
+	const auto set  = pass.sets[pass.next++ % pass.sets.size()];
+	vk::DescriptorImageInfo  image_info {nullptr, output.view, vk::ImageLayout::eGeneral};
+	vk::DescriptorBufferInfo buffer_info {exposure.buffer, exposure.offset, exposure.range};
+	vk::WriteDescriptorSet   writes[2] {};
+	writes[0].dstSet          = set;
+	writes[0].dstBinding      = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType  = vk::DescriptorType::eStorageImage;
+	writes[0].pImageInfo      = &image_info;
+	writes[1].dstSet          = set;
+	writes[1].dstBinding      = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType  = vk::DescriptorType::eStorageBuffer;
+	writes[1].pBufferInfo     = &buffer_info;
+	graphics.device.updateDescriptorSets(2, writes, 0, nullptr);
+	const ExposurePush push {exposure.index, output.extent.width, output.extent.height,
+	                         static_cast<uint32_t>(g_taa_alpha_mode.load()), g_taa_alpha_value.load(),
+	                         g_exposure_scale.load()};
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, pass.pipeline, Direct());
+	command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pass.layout, 0, 1, &set, 0, nullptr, Direct());
+	command.pushConstants(pass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push, Direct());
+	command.dispatch((output.extent.width + 7) / 8, (output.extent.height + 7) / 8, 1, Direct());
+	DirectFullBarrier(command);
+}
+
+} // namespace
+
+void ProbeReport(); // `taaprobe` (below)
+#endif
+
+bool EvaluateDlss(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& color, const SrImage& depth,
+                  const SrImage& motion, const SrImage& output, const TaaExposure& exposure) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!DlssEnabled() || !g_camera.valid || g_dlss_failures >= 8) return false;
+	if (color.image == nullptr || depth.image == nullptr || motion.image == nullptr || output.image == nullptr ||
+	    color.view == nullptr || depth.view == nullptr || motion.view == nullptr || output.view == nullptr) {
+		return false;
+	}
+	// DLAA: the TAA's output is its input's size.
+	if (output.extent != color.extent || depth.extent != color.extent || motion.extent != color.extent) return false;
+	// Only the full picture's TAA. Indoors the game runs the same shader again on a quarter-size lighting buffer
+	// (400x225 at 900p): that one stays the game's (DLSS there darkened indoor scenes, and switching DLSS between the
+	// two sizes reset it every frame).
+	static vk::Extent2D largest {};
+	if (uint64_t {color.extent.width} * color.extent.height > uint64_t {largest.width} * largest.height) {
+		largest = color.extent;
+	}
+	g_nis_scene_extent.store(uint64_t {largest.width} << 32u | largest.height, std::memory_order_relaxed);
+	if (color.extent != largest) {
+		static bool told = false;
+		if (!told) {
+			told = true;
+			std::printf("Frame generation: the %ux%u TAA pass stays the game's (DLSS takes the %ux%u one)\n",
+			            color.extent.width, color.extent.height, largest.width, largest.height);
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const bool options_changed = g_dlss_extent != output.extent || g_dlss_options_dirty.exchange(false);
+	if (options_changed && g_dlss_extent == output.extent) {
+		// (A previous instance still waiting: freed now only if its frames are done, else left as it is.)
+		if (g_dlss_free_id != 0 && g_api.free_resources != nullptr && g_dlss_evaluations >= g_dlss_free_at) {
+			(void)g_api.free_resources(sl::kFeatureDLSS, sl::ViewportHandle {g_dlss_free_id});
+		}
+		g_dlss_free_id     = g_dlss_viewport_id;
+		g_dlss_free_at     = g_dlss_evaluations + 8;
+		g_dlss_viewport_id = g_dlss_viewport_id < 13 ? 13 : g_dlss_viewport_id + 1;
+	}
+	const sl::ViewportHandle viewport {g_dlss_viewport_id};
+	bool                     reset = g_dlss_guest_frame == UINT64_MAX || g_guest_frame != g_dlss_guest_frame + 1;
+	if (options_changed) {
+		sl::DLSSOptions options {};
+		options.mode            = sl::DLSSMode::eDLAA;
+		options.outputWidth     = output.extent.width;
+		options.outputHeight    = output.extent.height;
+		options.colorBuffersHDR = g_dlss_hdr.load() != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		options.useAutoExposure = g_dlss_auto_exposure.load() != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		if (g_dlss_alpha.load() < 0) {
+			const char* alpha = std::getenv("KYTY_DLSS_ALPHA");
+			g_dlss_alpha      = alpha != nullptr && std::atoi(alpha) != 0 ? 1 : 0;
+		}
+		options.alphaUpscalingEnabled = g_dlss_alpha.load() != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		// KYTY_DLSS_PRESET=J|K|L|M: a DLSS model preset (default: the driver's choice for DLAA).
+		if (const char* preset = std::getenv("KYTY_DLSS_PRESET"); preset != nullptr && *preset >= 'J' && *preset <= 'M') {
+			options.dlaaPreset = static_cast<sl::DLSSPreset>(static_cast<uint32_t>(sl::DLSSPreset::ePresetJ) + (*preset - 'J'));
+		}
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("Frame generation: slDLSSSetOptions failed (%d): the game's TAA stays\n", static_cast<int>(result));
+			std::fflush(stdout);
+			g_dlss_failures = 8;
+			return false;
+		}
+		g_dlss_extent = output.extent;
+		reset         = true;
+		std::printf("Frame generation: DLSS (DLAA) at %ux%u, hdr %d, auto exposure %d, alpha %d\n", output.extent.width,
+		            output.extent.height, g_dlss_hdr.load(), g_dlss_auto_exposure.load(), g_dlss_alpha.load());
+		std::fflush(stdout);
+	}
+	// HDR: a frame index of DLAA's own, one per evaluation (as the super resolution path's): the present's index (RendererToken)
+	// was the same for two game frames now and then - the renderer runs ahead of the present - and Streamline then
+	// refused the second frame's camera ("different 'common' constants within the same frame": 6% of the frames, 18%
+	// with Reflex back at the present, 10-22).
+	// (The HDR launcher's, --hdr; SDR keeps the present's index, 10-22.)
+	sl::FrameToken* token = nullptr;
+	if (Config::HdrEnabled()) {
+		static uint32_t dlaa_frame = 0;
+		uint32_t        index      = ++dlaa_frame;
+		if (NewFrameToken(token, &index) != sl::Result::eOk) token = nullptr;
+	} else {
+		token = RendererToken();
+	}
+	if (token == nullptr) return false;
+	const auto constants = CameraConstants(g_camera, static_cast<float>(color.extent.width),
+	                                       static_cast<float>(color.extent.height), reset);
+	// (Two guest frames can fall within one presented frame index: Streamline then reports the second, different set
+	// as an error but keeps it, the one this evaluation reads.)
+	(void)g_api.set_constants(constants, *token, viewport);
+
+	DrainRecording();
+	DirectFullBarrier(command);
+	auto       color_resource  = SlResource(color);
+	auto       depth_resource  = SlResource(depth);
+	auto       motion_resource = SlResource(motion);
+	auto       output_resource = SlResource(output);
+	const sl::Extent full {0, 0, color.extent.width, color.extent.height};
+	sl::ResourceTag tags[] {
+	    sl::ResourceTag(&color_resource, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
+	    sl::ResourceTag(&depth_resource, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
+	    sl::ResourceTag(&motion_resource, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
+	    sl::ResourceTag(&output_resource, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
+	};
+	auto* sl_command = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
+	sl::Result result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), sl_command);
+	if (Evaluated(result)) {
+		const sl::BaseStructure* inputs[] {&viewport};
+		result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs, 1, sl_command);
+	}
+	DirectFullBarrier(command);
+	if (!Evaluated(result)) {
+		std::printf("Frame generation: DLSS evaluation failed (%d)%s\n", static_cast<int>(result),
+		            ++g_dlss_failures >= 8 ? ": the game's TAA stays" : "");
+		std::fflush(stdout);
+		return false;
+	}
+	ApplyExposure(graphics, command, output, exposure);
+	g_dlss_guest_frame = g_guest_frame;
+	const uint64_t evaluations = ++g_dlss_evaluations;
+	ProbeReport();
+	if (g_dlss_free_id != 0 && evaluations >= g_dlss_free_at) {
+		if (g_api.free_resources != nullptr) (void)g_api.free_resources(sl::kFeatureDLSS, sl::ViewportHandle {g_dlss_free_id});
+		g_dlss_free_id = 0;
+	}
+	if (evaluations == 1 || evaluations == 600) {
+		std::printf("Frame generation: DLSS evaluated %llu time(s)%s\n", static_cast<unsigned long long>(evaluations),
+		            result == sl::Result::eWarnOutOfVRAM ? " (Streamline: video memory budget exceeded)" : "");
+		std::fflush(stdout);
+	}
+	return true;
+#else
+	(void)graphics;
+	(void)command;
+	(void)color;
+	(void)depth;
+	(void)motion;
+	(void)output;
+	(void)exposure;
+	return false;
+#endif
+}
+
+bool PassThroughTaa(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& color, const SrImage& output,
+                    const TaaExposure& exposure) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!LateAaEnabled() || color.image == nullptr || output.image == nullptr || color.extent != output.extent ||
+	    color.layout == vk::ImageLayout::eUndefined)
+		return false;
+	// Only the full picture's TAA (as DLAA): the quarter-size indoor lighting pass stays the game's.
+	static vk::Extent2D largest {};
+	if (uint64_t {color.extent.width} * color.extent.height > uint64_t {largest.width} * largest.height) largest = color.extent;
+	if (color.extent != largest) return false;
+	static int unusable = -1; // (told once: the TAA's images cannot be copied; its TAA runs)
+	const bool same_format = color.format == output.format;
+	const auto features    = [&](vk::Format format) {
+        return graphics.physical_device.getFormatProperties(format).optimalTilingFeatures;
+	};
+	const bool can = (color.usage & vk::ImageUsageFlagBits::eTransferSrc) &&
+	                 (output.usage & vk::ImageUsageFlagBits::eTransferDst) && output.layout == vk::ImageLayout::eGeneral &&
+	                 (same_format || ((features(color.format) & vk::FormatFeatureFlagBits::eBlitSrc) &&
+	                                  (features(output.format) & vk::FormatFeatureFlagBits::eBlitDst)));
+	if (unusable < 0) {
+		unusable = can ? 0 : 1;
+		std::printf("Late DLSS: the TAA pass %s (color %d -> output %d, %ux%u, output layout %d)\n",
+		            can ? "replaced by a copy, DLSS anti-aliases later" : "cannot be copied through: the game's TAA runs",
+		            static_cast<int>(color.format), static_cast<int>(output.format), color.extent.width,
+		            color.extent.height, static_cast<int>(output.layout));
+		std::fflush(stdout);
+	}
+	if (!can) return false;
+	DrainRecording();
+	DirectFullBarrier(command);
+	// The color image in a transfer layout for the copy, then back as the texture cache has it.
+	const bool move = color.layout != vk::ImageLayout::eGeneral && color.layout != vk::ImageLayout::eTransferSrcOptimal;
+	const auto src_layout = move ? vk::ImageLayout::eTransferSrcOptimal : color.layout;
+	const auto relayout   = [&](vk::ImageLayout from, vk::ImageLayout to) {
+        vk::ImageMemoryBarrier2 barrier {};
+        barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+        barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+        barrier.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+        barrier.dstAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+        barrier.oldLayout           = from;
+        barrier.newLayout           = to;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image               = color.image;
+        barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        vk::DependencyInfo dependency {};
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers    = &barrier;
+        command.pipelineBarrier2(dependency, Direct());
+	};
+	if (move) relayout(color.layout, src_layout);
+	const vk::ImageSubresourceLayers layers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	if (same_format) {
+		vk::ImageCopy copy {};
+		copy.srcSubresource = layers;
+		copy.dstSubresource = layers;
+		copy.extent         = vk::Extent3D {color.extent.width, color.extent.height, 1};
+		command.copyImage(color.image, src_layout, output.image, vk::ImageLayout::eGeneral, 1, &copy, Direct());
+	} else {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = layers;
+		blit.dstSubresource = layers;
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(color.extent.width), static_cast<int32_t>(color.extent.height), 1};
+		blit.dstOffsets[1]  = blit.srcOffsets[1];
+		command.blitImage(color.image, src_layout, output.image, vk::ImageLayout::eGeneral, 1, &blit, vk::Filter::eNearest,
+		                  Direct());
+	}
+	if (move) relayout(src_layout, color.layout);
+	DirectFullBarrier(command);
+	ApplyExposure(graphics, command, output, exposure);
+	// (Late DLSS resets the count when it makes the frame's picture, after this.)
+	if (++g_late_unresolved == LateUnresolvedLimit) {
+		std::printf("Late DLSS: no picture made in %u frames whose TAA was copied through: the game's TAA runs again\n",
+		            LateUnresolvedLimit);
+		std::fflush(stdout);
+	}
+	return true;
+#else
+	(void)graphics;
+	(void)command;
+	(void)color;
+	(void)output;
+	(void)exposure;
+	return false;
+#endif
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& scene,
+                               TextureCache& cache);
+#endif
+
+vk::ImageView EvaluateNis(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& scene, TextureCache* cache) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_late_ready) return NisEnabled() && cache != nullptr ? EvaluateLateDlss(graphics, command, scene, *cache) : nullptr;
+	if (!NisEnabled() || g_nis_failures >= 8 || scene.image == nullptr || scene.view == nullptr) return nullptr;
+	const uint32_t height = g_nis_height;
+	const uint32_t width  = (height * 16u / 9u + 7u) / 8u * 8u;
+	// Only an upscale (a picture already this large stays as it is).
+	if (scene.extent.height >= height) return nullptr;
+	const sl::ViewportHandle viewport {2};
+	if (g_nis_image.image == nullptr) {
+		vk::ImageCreateInfo create {};
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {width, height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = vk::Format::eR16G16B16A16Sfloat;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+		create.sharingMode   = vk::SharingMode::eExclusive;
+		create.samples       = vk::SampleCountFlagBits::e1;
+		if (!graphics.CreateImage(create, g_nis_image)) {
+			std::printf("Frame generation: cannot allocate the %ux%u NIS image\n", width, height);
+			g_nis_failures = 8;
+			return nullptr;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = g_nis_image.image;
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = create.format;
+		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr, &g_nis_view), "NIS output view");
+		g_nis_image.state.layout = vk::ImageLayout::eUndefined;
+		g_nis_options_dirty      = true;
+	}
+	if (g_nis_options_dirty.exchange(false)) {
+		sl::NISOptions options {};
+		options.mode = sl::NISMode::eScaler;
+		options.sharpness = 0.3f;
+		if (const char* sharpness = std::getenv("KYTY_NIS_SHARPNESS"); sharpness != nullptr) {
+			options.sharpness = std::clamp(static_cast<float>(std::atof(sharpness)), 0.0f, 1.0f);
+		}
+		if (const int live = g_nis_sharpness_x100.load(); live >= 0) options.sharpness = static_cast<float>(live) / 100.0f;
+		// KYTY_NIS_HDR=linear|pq: the picture's encoding (default: SDR).
+		if (const char* hdr = std::getenv("KYTY_NIS_HDR"); hdr != nullptr) {
+			const std::string mode = hdr;
+			options.hdrMode = mode == "pq" ? sl::NISHDR::ePQ : mode == "linear" ? sl::NISHDR::eLinear : sl::NISHDR::eNone;
+		}
+		if (const int live = g_nis_hdr.load(); live >= 0) options.hdrMode = static_cast<sl::NISHDR>(live);
+		if (const auto result = g_api.nis_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("Frame generation: slNISSetOptions failed (%d)\n", static_cast<int>(result));
+			g_nis_failures = 8;
+			return nullptr;
+		}
+		std::printf("Frame generation: NIS %ux%u -> %ux%u, sharpness %.2f, hdr mode %d\n", scene.extent.width,
+		            scene.extent.height, width, height, static_cast<double>(options.sharpness),
+		            static_cast<int>(options.hdrMode));
+		std::fflush(stdout);
+	}
+	auto* token = RendererToken();
+	if (token == nullptr) return nullptr;
+	(void)g_api.set_constants(IdentityConstants(), *token, viewport);
+
+	DrainRecording();
+	DirectFullBarrier(command);
+	DirectLayout(command, g_nis_image, vk::ImageLayout::eGeneral);
+	SrImage output {g_nis_image.image, g_nis_view, vk::Format::eR16G16B16A16Sfloat, {width, height},
+	                vk::ImageLayout::eGeneral, vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled};
+	auto             input_resource  = SlResource(scene);
+	auto             output_resource = SlResource(output);
+	const sl::Extent input_extent {0, 0, scene.extent.width, scene.extent.height};
+	const sl::Extent output_extent {0, 0, width, height};
+	sl::ResourceTag  tags[] {
+        sl::ResourceTag(&input_resource, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &input_extent),
+        sl::ResourceTag(&output_resource, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_extent),
+    };
+	auto* sl_command = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
+	sl::Result result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), sl_command);
+	if (Evaluated(result)) {
+		const sl::BaseStructure* inputs[] {&viewport};
+		result = g_api.evaluate_feature(sl::kFeatureNIS, *token, inputs, 1, sl_command);
+	}
+	DirectLayout(command, g_nis_image, vk::ImageLayout::eShaderReadOnlyOptimal);
+	if (!Evaluated(result)) {
+		std::printf("Frame generation: NIS evaluation failed (%d)\n", static_cast<int>(result));
+		std::fflush(stdout);
+		++g_nis_failures;
+		return nullptr;
+	}
+	static uint32_t evaluations = 0;
+	if (++evaluations == 1 || evaluations == 600) {
+		std::printf("Frame generation: NIS evaluated %u time(s)\n", evaluations);
+		std::fflush(stdout);
+	}
+	return g_nis_view;
+#else
+	(void)graphics;
+	(void)command;
+	(void)scene;
+	(void)cache;
+	return nullptr;
+#endif
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+namespace {
+VulkanImage   g_late_image, g_late_depth, g_late_motion;
+vk::ImageView g_late_view = nullptr, g_late_depth_view = nullptr, g_late_motion_view = nullptr;
+uint64_t      g_late_guest_frame = UINT64_MAX;
+uint64_t      g_late_evaluations = 0;
+vk::Extent2D  g_late_input {};
+} // namespace
+
+// KYTY_LATE_DLSS: the finished picture at the render size (`scene`, the final composite's) upscaled by DLSS super
+// resolution, with the TAA pass's depth and motion vectors (copied: the game may reuse them before the flip) and the
+// G-buffer camera. The picture is already resolved (the TAA or DLAA ran, without jitter) and graded: no jitter, no
+// HDR, no exposure for DLSS. The view to bind in the scene's place (shader-read-only), or null (the game's stretch).
+vk::ImageView EvaluateLateDlss(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& scene,
+                               TextureCache& cache) {
+	if (g_late_failures >= LateFailureLimit || scene.image == nullptr || scene.view == nullptr) return nullptr;
+	if (!g_sources.valid || !g_camera.valid) return nullptr; // (a menu, a movie: no 3D this frame)
+	const uint32_t height = g_late_height;
+	const uint32_t width  = (height * 16u / 9u + 7u) / 8u * 8u;
+	if (scene.extent.height >= height) return nullptr;
+	if (g_late_sources.extent != scene.extent) return nullptr; // (no full-size TAA pass seen of the picture's size)
+	// (The sources may be an earlier frame's, their images retired since - the texture cache retires a world's images
+	// after a world change, TextureCache::RetireStaleImages: TryGetImage, not GetImage, on a stale id.)
+	auto* depth_image  = cache.TryGetImage(g_late_sources.depth);
+	auto* motion_image = cache.TryGetImage(g_late_sources.motion);
+	if (depth_image == nullptr || motion_image == nullptr) {
+		g_late_sources = {};
+		g_late_largest = {};
+		return nullptr;
+	}
+	auto& depth  = *depth_image;
+	auto& motion = *motion_image;
+	if (depth.info.data.address != g_late_sources.depth_address ||
+	    motion.info.data.address != g_late_sources.motion_address ||
+	    motion.backing.extent.width != scene.extent.width || motion.backing.extent.height != scene.extent.height ||
+	    depth.backing.extent.width != scene.extent.width || depth.backing.extent.height != scene.extent.height) {
+		static uint32_t told = 0;
+		if (told++ < 4) {
+			std::printf("Late DLSS: the TAA's depth %ux%u / motion %ux%u do not match the picture %ux%u: not upscaled\n",
+			            depth.backing.extent.width, depth.backing.extent.height, motion.backing.extent.width,
+			            motion.backing.extent.height, scene.extent.width, scene.extent.height);
+			std::fflush(stdout);
+		}
+		return nullptr;
+	}
+	const sl::ViewportHandle viewport {1000}; // (DLAA's viewports count up from 11 with each live option change)
+	if (g_late_image.image == nullptr) {
+		vk::ImageCreateInfo create {};
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {width, height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = vk::Format::eR16G16B16A16Sfloat;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+		create.sharingMode   = vk::SharingMode::eExclusive;
+		create.samples       = vk::SampleCountFlagBits::e1;
+		if (!graphics.CreateImage(create, g_late_image)) {
+			std::printf("Late DLSS: cannot allocate the %ux%u output image\n", width, height);
+			g_late_failures = LateFailureLimit;
+			return nullptr;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = g_late_image.image;
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = create.format;
+		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr, &g_late_view), "late DLSS output view");
+		g_late_image.state.layout = vk::ImageLayout::eUndefined;
+	}
+	bool reset = g_late_guest_frame == UINT64_MAX || g_guest_frame != g_late_guest_frame + 1;
+	if (g_late_input != scene.extent) {
+		const float share = static_cast<float>(scene.extent.height) / static_cast<float>(height);
+		sl::DLSSOptions options {};
+		options.mode = share >= 0.95f   ? sl::DLSSMode::eDLAA
+		               : share >= 0.62f ? sl::DLSSMode::eMaxQuality
+		               : share >= 0.55f ? sl::DLSSMode::eBalanced
+		               : share >= 0.45f ? sl::DLSSMode::eMaxPerformance
+		                                : sl::DLSSMode::eUltraPerformance;
+		options.outputWidth     = width;
+		options.outputHeight    = height;
+		const char* hdr         = std::getenv("KYTY_LATE_DLSS_HDR");
+		options.colorBuffersHDR = hdr != nullptr && hdr[0] == '1' ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		options.useAutoExposure = options.colorBuffersHDR;
+		if (const char* preset = std::getenv("KYTY_DLSS_PRESET"); preset != nullptr && *preset >= 'A' && *preset <= 'O') {
+			const auto value = static_cast<sl::DLSSPreset>(*preset - 'A' + 1);
+			options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset =
+			    options.ultraPerformancePreset = options.ultraQualityPreset = value;
+		}
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("Late DLSS: slDLSSSetOptions failed (%d): the game's TAA and stretch stay\n", static_cast<int>(result));
+			std::fflush(stdout);
+			g_late_failures = LateFailureLimit;
+			return nullptr;
+		}
+		g_late_input = scene.extent;
+		reset        = true;
+		std::printf("Late DLSS: %ux%u -> %ux%u, mode %u, picture format %d, hdr %d\n", scene.extent.width,
+		            scene.extent.height, width, height, static_cast<uint32_t>(options.mode), static_cast<int>(scene.format),
+		            options.colorBuffersHDR == sl::Boolean::eTrue ? 1 : 0);
+		std::fflush(stdout);
+	}
+	static uint32_t late_frame = 0;
+	uint32_t        index      = ++late_frame;
+	sl::FrameToken* token      = nullptr;
+	if (NewFrameToken(token, &index) != sl::Result::eOk || token == nullptr) return nullptr;
+	auto constants = CameraConstants(g_camera, static_cast<float>(scene.extent.width),
+	                                 static_cast<float>(scene.extent.height), reset);
+	// (Resolved by the TAA or DLAA: no jitter left in it. KYTY_LATE_DLSS_AA: the game's jitter, its TAA not run.)
+	if (!g_late_aa) constants.jitterOffset = sl::float2(0.0f, 0.0f);
+	(void)g_api.set_constants(constants, *token, viewport);
+
+	// The TAA's depth and motion vectors copied (recorded), then DLSS (direct, after the recorded work).
+	Configure(graphics, g_late_depth, g_late_depth_view, depth.backing);
+	Configure(graphics, g_late_motion, g_late_motion_view, motion.backing);
+	CopyInto(command, depth, g_late_depth);
+	CopyInto(command, motion, g_late_motion);
+	DrainRecording();
+	DirectFullBarrier(command);
+	DirectLayout(command, g_late_image, vk::ImageLayout::eGeneral);
+	const SrImage depth_copy {g_late_depth.image, g_late_depth_view, g_late_depth.format,
+	                          {g_late_depth.extent.width, g_late_depth.extent.height},
+	                          vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageUsageFlagBits::eSampled};
+	const SrImage motion_copy {g_late_motion.image, g_late_motion_view, g_late_motion.format,
+	                           {g_late_motion.extent.width, g_late_motion.extent.height},
+	                           vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageUsageFlagBits::eSampled};
+	const SrImage output {g_late_image.image, g_late_view, vk::Format::eR16G16B16A16Sfloat, {width, height},
+	                      vk::ImageLayout::eGeneral, vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled};
+	auto             color_resource  = SlResource(scene);
+	auto             depth_resource  = SlResource(depth_copy);
+	auto             motion_resource = SlResource(motion_copy);
+	auto             output_resource = SlResource(output);
+	const sl::Extent input_extent {0, 0, scene.extent.width, scene.extent.height};
+	const sl::Extent output_extent {0, 0, width, height};
+	sl::ResourceTag  tags[] {
+        sl::ResourceTag(&color_resource, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &input_extent),
+        sl::ResourceTag(&depth_resource, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &input_extent),
+        sl::ResourceTag(&motion_resource, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &input_extent),
+        sl::ResourceTag(&output_resource, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_extent),
+    };
+	auto* sl_command = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
+	sl::Result result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), sl_command);
+	if (Evaluated(result)) {
+		const sl::BaseStructure* inputs[] {&viewport};
+		result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs, 1, sl_command);
+	}
+	DirectLayout(command, g_late_image, vk::ImageLayout::eShaderReadOnlyOptimal);
+	if (!Evaluated(result)) {
+		// (The frame's stretch; the next frame tries again. The first 8 and then every 100th are logged.)
+		static uint32_t failed = 0;
+		++g_late_failures;
+		if (++failed <= 8 || failed % 100 == 0 || g_late_failures == LateFailureLimit) {
+			std::printf("Late DLSS: evaluation failed (%d), %u in a row, %u in all%s\n", static_cast<int>(result),
+			            g_late_failures, failed,
+			            g_late_failures >= LateFailureLimit ? ": the game's TAA and stretch stay" : "");
+			std::fflush(stdout);
+		}
+		return nullptr;
+	}
+	g_late_guest_frame = g_guest_frame;
+	g_late_unresolved  = 0;
+	g_late_failures    = 0;
+	if (++g_late_evaluations == 1 || g_late_evaluations == 600) {
+		std::printf("Late DLSS: evaluated %llu time(s)\n", static_cast<unsigned long long>(g_late_evaluations));
+		std::fflush(stdout);
+	}
+	return g_late_view;
+}
+#endif
+
+// ---- KYTY_LIVE_FILE `taaprobe`: the game's TAA result and DLSS's, pixel by pixel (debugging) ----
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+namespace {
+
+constexpr uint32_t kProbeCols = 16, kProbeRows = 9, kProbePoints = kProbeCols * kProbeRows, kProbeImages = 3;
+std::atomic<int>   g_probe_requests {0};
+struct Probe {
+	VkBuffer      buffer     = VK_NULL_HANDLE;
+	VmaAllocation allocation = nullptr;
+	VmaAllocator  allocator  = nullptr;
+	void*         mapped     = nullptr;
+	bool          pending    = false;
+	bool          dlss       = false;
+	uint64_t      ready_at   = 0;
+	vk::Extent2D  extent {};
+	uint32_t      points[kProbePoints][2] {};
+};
+Probe g_probe;
+
+float HalfToFloat(uint16_t h) {
+	const uint32_t sign = (h >> 15) & 1u, exponent = (h >> 10) & 0x1fu, mantissa = h & 0x3ffu;
+	float          value = 0.0f;
+	if (exponent == 0) {
+		value = std::ldexp(static_cast<float>(mantissa), -24);
+	} else if (exponent == 31) {
+		value = mantissa == 0 ? INFINITY : NAN;
+	} else {
+		value = std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
+	}
+	return sign != 0 ? -value : value;
+}
+
+void ProbeLayout(vk::CommandBuffer command, vk::Image image, vk::ImageLayout from, vk::ImageLayout to) {
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.oldLayout           = from;
+	barrier.newLayout           = to;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency, Direct());
+}
+
+// The probe points of `image` (RGBA16F) into the buffer's section `section`.
+void ProbeCopy(vk::CommandBuffer command, const SrImage& image, uint32_t section) {
+	const bool general = image.layout == vk::ImageLayout::eGeneral;
+	if (!general) ProbeLayout(command, image.image, image.layout, vk::ImageLayout::eGeneral);
+	std::array<vk::BufferImageCopy, kProbePoints> regions {};
+	for (uint32_t i = 0; i < kProbePoints; i++) {
+		regions[i].bufferOffset      = (static_cast<vk::DeviceSize>(section) * kProbePoints + i) * 8u;
+		regions[i].imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		regions[i].imageOffset       = vk::Offset3D {static_cast<int32_t>(g_probe.points[i][0]),
+                                               static_cast<int32_t>(g_probe.points[i][1]), 0};
+		regions[i].imageExtent       = vk::Extent3D {1, 1, 1};
+	}
+	command.copyImageToBuffer(image.image, vk::ImageLayout::eGeneral, vk::Buffer(g_probe.buffer),
+	                          static_cast<uint32_t>(regions.size()), regions.data(), Direct());
+	if (!general) ProbeLayout(command, image.image, vk::ImageLayout::eGeneral, image.layout);
+}
+
+} // namespace
+
+// Renderer thread, after a DLSS evaluation: the probe's pixels once its frame is done on the GPU.
+void ProbeReport() {
+	if (!g_probe.pending || g_dlss_evaluations < g_probe.ready_at) return;
+	g_probe.pending = false;
+	vmaInvalidateAllocation(g_probe.allocator, g_probe.allocation, 0, VK_WHOLE_SIZE);
+	const auto* texels = static_cast<const uint16_t*>(g_probe.mapped);
+	const auto  pixel  = [&](uint32_t section, uint32_t i, uint32_t c) {
+        return HalfToFloat(texels[(section * kProbePoints + i) * 4u + c]);
+	};
+	const char* names[kProbeImages] {"input", "game", "dlss"};
+	double      sum[kProbeImages][5] {};
+	float       amin[kProbeImages], amax[kProbeImages];
+	uint32_t    bad[kProbeImages] {};
+	for (uint32_t s = 0; s < kProbeImages; s++) {
+		amin[s] = INFINITY;
+		amax[s] = -INFINITY;
+		for (uint32_t i = 0; i < kProbePoints; i++) {
+			float v[4];
+			for (uint32_t c = 0; c < 4; c++) v[c] = pixel(s, i, c);
+			if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]) || !std::isfinite(v[3])) {
+				bad[s]++;
+				continue;
+			}
+			for (uint32_t c = 0; c < 4; c++) sum[s][c] += v[c];
+			sum[s][4] += 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+			amin[s] = std::min(amin[s], v[3]);
+			amax[s] = std::max(amax[s], v[3]);
+		}
+	}
+	std::printf("TAAPROBE %ux%u, %u points, dlss %s\n", g_probe.extent.width, g_probe.extent.height, kProbePoints,
+	            g_probe.dlss ? "ran" : "did not run");
+	for (uint32_t s = 0; s < kProbeImages; s++) {
+		const double n = std::max(1u, kProbePoints - bad[s]);
+		std::printf("TAAPROBE mean %-5s r %.4f g %.4f b %.4f a %.4f luma %.4f | alpha %.4f..%.4f | nan/inf %u\n", names[s],
+		            sum[s][0] / n, sum[s][1] / n, sum[s][2] / n, sum[s][3] / n, sum[s][4] / n, static_cast<double>(amin[s]),
+		            static_cast<double>(amax[s]), bad[s]);
+	}
+	if (sum[1][4] > 0.0) {
+		std::printf("TAAPROBE luma dlss/game %.3f, input/game %.3f\n", sum[2][4] / sum[1][4], sum[0][4] / sum[1][4]);
+	}
+	for (uint32_t i = 0; i < kProbePoints; i++) {
+		std::printf("TAAPROBE p %4u %4u", g_probe.points[i][0], g_probe.points[i][1]);
+		for (uint32_t s = 0; s < kProbeImages; s++) {
+			std::printf(" | %s %.4f %.4f %.4f %.4f", names[s], static_cast<double>(pixel(s, i, 0)),
+			            static_cast<double>(pixel(s, i, 1)), static_cast<double>(pixel(s, i, 2)),
+			            static_cast<double>(pixel(s, i, 3)));
+		}
+		std::printf("\n");
+	}
+	std::fflush(stdout);
+}
+#endif
+
+bool TaaProbeWanted(vk::Extent2D extent) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return g_probe_requests.load(std::memory_order_relaxed) > 0 && !g_probe.pending && DlssEnabled() &&
+	       extent == g_dlss_extent;
+#else
+	(void)extent;
+	return false;
+#endif
+}
+
+void TaaProbe(GraphicContext& graphics, vk::CommandBuffer command, const SrImage& color, const SrImage& depth,
+              const SrImage& motion, const SrImage& output, const TaaExposure& exposure) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	g_probe_requests.fetch_sub(1);
+	const auto rgba16f = vk::Format::eR16G16B16A16Sfloat;
+	const char* refused = color.format != rgba16f || output.format != rgba16f ? "not RGBA16F"
+	                    : !(color.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
+	                              !(output.usage & vk::ImageUsageFlagBits::eTransferSrc) ? "no transfer-source usage"
+	                    : color.layout == vk::ImageLayout::eUndefined || output.layout == vk::ImageLayout::eUndefined
+	                        ? "undefined layout" : nullptr;
+	if (refused == nullptr && g_probe.buffer == VK_NULL_HANDLE) {
+		VkBufferCreateInfo buffer_info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		buffer_info.size        = static_cast<VkDeviceSize>(kProbeImages) * kProbePoints * 8u;
+		buffer_info.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VmaAllocationCreateInfo allocation_info {};
+		allocation_info.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		VmaAllocationInfo info {};
+		if (vmaCreateBuffer(graphics.allocator, &buffer_info, &allocation_info, &g_probe.buffer, &g_probe.allocation,
+		                    &info) != VK_SUCCESS || info.pMappedData == nullptr) {
+			g_probe.buffer = VK_NULL_HANDLE;
+			refused        = "no readback buffer";
+		} else {
+			g_probe.allocator = graphics.allocator;
+			g_probe.mapped    = info.pMappedData;
+		}
+	}
+	if (refused != nullptr) {
+		std::printf("TAAPROBE skipped: %s (color %d, output %d)\n", refused, static_cast<int>(color.format),
+		            static_cast<int>(output.format));
+		std::fflush(stdout);
+		(void)EvaluateDlss(graphics, command, color, depth, motion, output, exposure);
+		return;
+	}
+	g_probe.extent = color.extent;
+	for (uint32_t j = 0; j < kProbeRows; j++) {
+		for (uint32_t i = 0; i < kProbeCols; i++) {
+			g_probe.points[j * kProbeCols + i][0] = (2 * i + 1) * color.extent.width / (2 * kProbeCols);
+			g_probe.points[j * kProbeCols + i][1] = (2 * j + 1) * color.extent.height / (2 * kProbeRows);
+		}
+	}
+	DrainRecording();
+	DirectFullBarrier(command);
+	ProbeCopy(command, color, 0);
+	ProbeCopy(command, output, 1);
+	DirectFullBarrier(command);
+	g_probe.dlss = EvaluateDlss(graphics, command, color, depth, motion, output, exposure);
+	DirectFullBarrier(command);
+	ProbeCopy(command, output, 2);
+	DirectFullBarrier(command);
+	g_probe.pending  = true;
+	g_probe.ready_at = g_dlss_evaluations + 12;
+	std::printf("TAAPROBE recorded (color layout %d, output layout %d)\n", static_cast<int>(color.layout),
+	            static_cast<int>(output.layout));
+	std::fflush(stdout);
+#else
+	(void)graphics;
+	(void)command;
+	(void)color;
+	(void)depth;
+	(void)motion;
+	(void)output;
+	(void)exposure;
+#endif
+}
+
+// ---- In-game switches: F6 DLAA, Shift+F6 NIS, Ctrl+F6 / Ctrl+Shift+F6 NIS sharpness, F4 the 30 fps cap, F12 the FPS panel (window.cpp),
+// remembered in KYTY_TOGGLE_FILE ----
+
+namespace {
+
+std::atomic<int>                      g_flip_floor {0};
+std::atomic<int>                      g_hud_shown {-1}; // F12: -1 KYTY_FPS_HUD, 0 hidden, 1 shown
+int                                   g_flip_floor_on = 1; // the cap's rate when on (KYTY_FLIP_RATE, else 1: 30 fps)
+std::mutex                            g_toggle_mutex;
+std::string                           g_notice;
+std::chrono::steady_clock::time_point g_notice_until {};
+
+bool DlssSwitchOn() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return !g_dlss_off.load();
+#else
+	return false;
+#endif
+}
+bool NisSwitchOn() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return !g_nis_off.load();
+#else
+	return false;
+#endif
+}
+
+// NIS sharpness in hundredths: the live/Ctrl+F6 value, else KYTY_NIS_SHARPNESS, else 30.
+int NisSharpnessX100() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (const int live = g_nis_sharpness_x100.load(); live >= 0) return live;
+#endif
+	const char* env = std::getenv("KYTY_NIS_SHARPNESS");
+	return env != nullptr ? std::clamp(static_cast<int>(std::atof(env) * 100.0 + 0.5), 0, 100) : 30;
+}
+
+void LoadToggles() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const char* rate = std::getenv("KYTY_FLIP_RATE");
+		const int   env  = std::clamp(rate != nullptr ? std::atoi(rate) : 0, 0, 2);
+		g_flip_floor_on  = env > 0 ? env : 1;
+		g_flip_floor     = env;
+		const char* path = std::getenv("KYTY_TOGGLE_FILE");
+		if (path == nullptr || *path == '\0') return;
+		std::ifstream file(path);
+		std::string   line;
+		while (std::getline(file, line)) {
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			const auto split = line.find('=');
+			if (split == std::string::npos) continue;
+			const auto key = line.substr(0, split);
+			const bool on  = std::atoi(line.c_str() + split + 1) != 0;
+			if (key == "cap") {
+				g_flip_floor = on ? g_flip_floor_on : 0;
+			} else if (key == "hud") {
+				g_hud_shown = on ? 1 : 0;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+			} else if (key == "dlss") {
+				g_dlss_off = !on;
+			} else if (key == "nis") {
+				g_nis_off = !on;
+			} else if (key == "sharp") {
+				g_nis_sharpness_x100 = std::clamp(std::atoi(line.c_str() + split + 1), 0, 100);
+#endif
+			}
+		}
+		std::printf("Frame generation: switches from %s: DLSS %s, NIS %s (sharpness %.2f), 30 fps cap %s\n", path,
+		            DlssSwitchOn() ? "on" : "off", NisSwitchOn() ? "on" : "off", NisSharpnessX100() / 100.0,
+		            g_flip_floor.load() > 0 ? "on" : "off");
+		std::fflush(stdout);
+	});
+}
+
+void SaveToggles() {
+	const char* path = std::getenv("KYTY_TOGGLE_FILE");
+	if (path == nullptr || *path == '\0') return;
+	std::ofstream file(path, std::ios::trunc);
+	file << "dlss=" << (DlssSwitchOn() ? 1 : 0) << "\nnis=" << (NisSwitchOn() ? 1 : 0)
+	     << "\ncap=" << (g_flip_floor.load() > 0 ? 1 : 0) << "\nsharp=" << NisSharpnessX100() << "\n";
+	if (const int hud = g_hud_shown.load(); hud >= 0) file << "hud=" << hud << "\n";
+}
+
+} // namespace
+
+void Toggle(Switch which) {
+	LoadToggles();
+	std::string note;
+	switch (which) {
+		case Switch::Dlss:
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+			if (g_dlss_ready) {
+				g_dlss_off = !g_dlss_off.load();
+				note       = g_dlss_off ? "DLAA off: the game's TAA  [F6]" : "DLAA on  [F6]";
+				break;
+			}
+#endif
+			note = "DLSS is not available here (start with KYTY_DLSS / KYTY_NIS / KYTY_LATE_DLSS: the late DLSS launcher)";
+			break;
+		case Switch::Nis:
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+			if (g_late_ready) {
+				g_nis_off = !g_nis_off.load();
+				note      = g_nis_off ? "Late DLSS off: the game's own scaling  [Shift+F6]"
+				                      : "Late DLSS on: the finished picture upscaled by DLSS to " + std::to_string(g_late_height) +
+				                            (g_late_aa ? ", DLSS anti-aliasing" : "") + "  [Shift+F6]";
+				break;
+			}
+			if (g_nis_ready) {
+				g_nis_off = !g_nis_off.load();
+				note      = g_nis_off ? "NIS off: the game's own scaling  [Shift+F6]"
+				                      : "NIS on: sharper scaling to " + std::to_string(g_nis_height) + "  [Shift+F6]";
+				break;
+			}
+#endif
+			note = "NIS is not available here (start with KYTY_DLSS / KYTY_NIS / KYTY_LATE_DLSS: the late DLSS launcher)";
+			break;
+		case Switch::NisSharper:
+		case Switch::NisSofter: {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+			if (g_nis_ready) {
+				// Steps of 0.15 from 0 to 0.90, then 1.0 (the default 0.30 is one of them); Ctrl+F6 up, Ctrl+Shift+F6 down.
+				static constexpr int kSteps[] {0, 15, 30, 45, 60, 75, 90, 100};
+				const int now  = NisSharpnessX100();
+				int       next = now;
+				if (which == Switch::NisSharper) {
+					next = 100;
+					for (const int step : kSteps) {
+						if (step > now) {
+							next = step;
+							break;
+						}
+					}
+				} else {
+					next = 0;
+					for (const int step : kSteps) {
+						if (step < now) next = step;
+					}
+				}
+				g_nis_sharpness_x100 = next;
+				g_nis_options_dirty  = true;
+				char text[96];
+				std::snprintf(text, sizeof(text), "NIS sharpening %.2f%s  [Ctrl+F6 / Ctrl+Shift+F6]", next / 100.0,
+				              g_nis_off ? " (NIS is off: Shift+F6)" : next == 100 ? " (maximum)" : next == 0 ? " (none)" : "");
+				note = text;
+				break;
+			}
+#endif
+			note = "NIS is not available here (start with KYTY_DLSS / KYTY_NIS / KYTY_LATE_DLSS: the late DLSS launcher)";
+			break;
+		}
+		case Switch::Hud: {
+			const char* env   = std::getenv("KYTY_FPS_HUD");
+			const bool  shown = g_hud_shown.load() >= 0 ? g_hud_shown.load() != 0
+			                                            : env != nullptr && *env != '\0' && std::string_view(env) != "0";
+			g_hud_shown = shown ? 0 : 1;
+			note        = shown ? "FPS panel hidden  [F12]" : "FPS panel shown  [F12]";
+			break;
+		}
+		case Switch::Cap:
+			g_flip_floor = g_flip_floor.load() > 0 ? 0 : g_flip_floor_on;
+			note = g_flip_floor.load() > 0
+			           ? (Enabled() ? "30 fps cap on: 60 with frame generation  [F4]" : "30 fps cap on  [F4]")
+			           : "30 fps cap off: as fast as it runs  [F4]";
+			break;
+	}
+	SaveToggles();
+	std::printf("Frame generation: %s\n", note.c_str());
+	std::fflush(stdout);
+	std::lock_guard lock(g_toggle_mutex);
+	g_notice       = note;
+	g_notice_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+}
+
+int FlipRateFloor() {
+	LoadToggles();
+	return g_flip_floor.load(std::memory_order_relaxed);
+}
+
+bool HudShown(bool fallback) {
+	LoadToggles();
+	const int shown = g_hud_shown.load(std::memory_order_relaxed);
+	return shown >= 0 ? shown != 0 : fallback;
+}
+
+void ShowNotice(std::string note) {
+	std::lock_guard lock(g_toggle_mutex);
+	g_notice       = std::move(note);
+	g_notice_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+}
+
+std::string HudNotice() {
+	std::lock_guard lock(g_toggle_mutex);
+	if (g_notice.empty() || std::chrono::steady_clock::now() >= g_notice_until) return {};
+	return g_notice;
 }
 
 bool UsesFsr() {
@@ -2904,5 +4447,77 @@ uint32_t Generate(GraphicContext& graphics, vk::CommandBuffer command, const Fra
 	return 0;
 #endif
 }
+
+// ---- KYTY_LIVE_FILE switches for DLSS / NIS (tools: _dlss\\live-commands.txt) ----
+
+bool LiveCommand(std::string_view command, std::string_view value) {
+#ifndef KYTY_FRAMEGEN_STREAMLINE
+	(void)command;
+	(void)value;
+	return false;
+#else
+	const bool on = value == "on" || value == "1", off = value == "off" || value == "0";
+	if (command == "dlss" && (on || off)) {
+		g_dlss_off = off;
+	} else if (command == "nis" && (on || off)) {
+		g_nis_off = off;
+	} else if (command == "dlssexp" && (value == "auto" || off)) {
+		g_dlss_auto_exposure = value == "auto" ? 1 : 0;
+		g_dlss_options_dirty = true;
+	} else if (command == "dlssalpha" && (on || off)) {
+		g_dlss_alpha         = on ? 1 : 0;
+		g_dlss_options_dirty = true;
+	} else if (command == "dlssexposure" && (on || off)) {
+		g_exposure_on = on;
+	} else if (command == "taaalpha") {
+		if (value == "keep") {
+			g_taa_alpha_mode = 0;
+		} else {
+			g_taa_alpha_value = static_cast<float>(std::atof(std::string(value).c_str()));
+			g_taa_alpha_mode  = 1;
+		}
+	} else if (command == "exposurescale") {
+		g_exposure_scale = static_cast<float>(std::atof(std::string(value).c_str()));
+	} else if (command == "taaprobe") {
+		g_probe_requests = 1;
+	} else if (command == "dlsshdr" && (on || off)) {
+		g_dlss_hdr           = on ? 1 : 0;
+		g_dlss_options_dirty = true;
+	} else if (command == "nishdr" && (value == "none" || value == "linear" || value == "pq")) {
+		g_nis_hdr = value == "pq" ? static_cast<int>(sl::NISHDR::ePQ)
+		          : value == "linear" ? static_cast<int>(sl::NISHDR::eLinear) : static_cast<int>(sl::NISHDR::eNone);
+		g_nis_options_dirty = true;
+	} else if (command == "nissharp") {
+		const double sharpness = std::atof(std::string(value).c_str());
+		if (sharpness < 0.0 || sharpness > 1.0) return false;
+		g_nis_sharpness_x100 = static_cast<int>(sharpness * 100.0 + 0.5);
+		g_nis_options_dirty  = true;
+	} else {
+		return false;
+	}
+	std::printf("Frame generation: live %.*s %.*s\n", static_cast<int>(command.size()), command.data(),
+	            static_cast<int>(value.size()), value.data());
+	std::fflush(stdout);
+	return true;
+#endif
+}
+
+const char* QualityLabel() {
+#ifndef KYTY_FRAMEGEN_STREAMLINE
+	return "";
+#else
+	static thread_local std::string label;
+	label.clear();
+	if (g_dlss_ready) label += g_dlss_off ? "DLAA off" : g_dlss_alpha.load() != 0 ? "DLAA on (alpha)" : "DLAA on";
+	if (g_late_ready) label += std::string(label.empty() ? "" : "  |  ") + (g_nis_off ? "late DLSS off" : "late DLSS on");
+	if (g_nis_ready && !g_late_ready) {
+		char nis[48] = "NIS off";
+		if (!g_nis_off) std::snprintf(nis, sizeof(nis), "NIS on (sharp %.2f)", NisSharpnessX100() / 100.0);
+		label += std::string(label.empty() ? "" : "  |  ") + nis;
+	}
+	return label.c_str();
+#endif
+}
+
 
 } // namespace Libs::Graphics::FrameGen

@@ -50,25 +50,6 @@ std::optional<uint64_t> FindRenderConstant(const Program& program, std::string_v
 	return constants.size() == 1 ? std::optional(constants[0]) : std::nullopt;
 }
 
-// The one place `bytes` is in the program's loaded segments.
-std::optional<uint64_t> FindUniqueData(const Program& program, std::span<const uint8_t> bytes) {
-	const auto* elf = program.elf.get();
-	if (elf == nullptr || elf->GetEhdr() == nullptr || elf->GetPhdr() == nullptr) return std::nullopt;
-	std::vector<uint64_t> found;
-	const auto*           phdr = elf->GetPhdr();
-	for (size_t i = 0; i < elf->GetEhdr()->e_phnum && found.size() < 2; i++) {
-		if (phdr[i].p_type != PT_LOAD || phdr[i].p_filesz < bytes.size()) continue;
-		const auto address = program.base_vaddr + phdr[i].p_vaddr;
-		if (!Readable(address, phdr[i].p_filesz)) continue;
-		const auto* begin = reinterpret_cast<const uint8_t*>(address);
-		const auto* end   = begin + phdr[i].p_filesz;
-		for (const auto* at = std::search(begin, end, bytes.begin(), bytes.end()); at != end && found.size() < 2;
-		     at             = std::search(at + 1, end, bytes.begin(), bytes.end()))
-			found.push_back(reinterpret_cast<uint64_t>(at));
-	}
-	return found.size() == 1 ? std::optional(found[0]) : std::nullopt;
-}
-
 double   g_wide_aspect = 0.0; // the aspect KYTY_RENDER_ASPECT installed (0: 16:9)
 uint32_t g_wide_output = 0;   // the output's width InstallWideOutput set (0: the game's 3840)
 
@@ -135,6 +116,24 @@ bool InstallWideOutput(const Program& program, int mode, uint32_t width, uint32_
 
 } // namespace
 
+std::optional<uint64_t> FindUniqueData(const Program& program, std::span<const uint8_t> bytes) {
+	const auto* elf = program.elf.get();
+	if (elf == nullptr || elf->GetEhdr() == nullptr || elf->GetPhdr() == nullptr) return std::nullopt;
+	std::vector<uint64_t> found;
+	const auto*           phdr = elf->GetPhdr();
+	for (size_t i = 0; i < elf->GetEhdr()->e_phnum && found.size() < 2; i++) {
+		if (phdr[i].p_type != PT_LOAD || phdr[i].p_filesz < bytes.size()) continue;
+		const auto address = program.base_vaddr + phdr[i].p_vaddr;
+		if (!Readable(address, phdr[i].p_filesz)) continue;
+		const auto* begin = reinterpret_cast<const uint8_t*>(address);
+		const auto* end   = begin + phdr[i].p_filesz;
+		for (const auto* at = std::search(begin, end, bytes.begin(), bytes.end()); at != end && found.size() < 2;
+		     at             = std::search(at + 1, end, bytes.begin(), bytes.end()))
+			found.push_back(reinterpret_cast<uint64_t>(at));
+	}
+	return found.size() == 1 ? std::optional(found[0]) : std::nullopt;
+}
+
 double WideAspect() {
 	return g_wide_aspect;
 }
@@ -159,11 +158,14 @@ void Install(Program* program) {
 	const char* setting = std::getenv("KYTY_RENDER_HEIGHT");
 	const char* wide    = std::getenv("KYTY_RENDER_ASPECT");
 	const bool  numeric   = setting != nullptr && *setting != 0 && std::strcmp(setting, "auto") != 0;
-	const auto  automatic = AutoHeight(DemonsSoulsSuperResolution::Active());
 	// (The PS5 Pro path with the HD output always: its 1080p output is made here. The HD output alone always too: its
 	// display mode 1 is, below.)
 	const bool  hd_pro    = DemonsSoulsSuperResolution::Active() && DemonsSoulsSuperResolution::HdOutput();
 	const bool  hd        = DemonsSoulsHdOutput::Active() && !hd_pro;
+	// (The HD path at the late DLSS output's size, DemonsSoulsHdOutput::LateOutputHeight: half its height by default,
+	// DLSS's performance mode, not the window's.)
+	const bool  late      = hd && DemonsSoulsHdOutput::OutputHeight() != DemonsSoulsHdOutput::HdHeight;
+	const auto  automatic = late ? 0u : AutoHeight(DemonsSoulsSuperResolution::Active());
 	if ((!numeric && automatic == 0 && !hd_pro && !hd && (wide == nullptr || *wide == 0)) || program == nullptr ||
 	    !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
@@ -177,11 +179,13 @@ void Install(Program* program) {
 	// (hd_pro's output: 1920x1080, or KYTY_OUTPUT_HEIGHT's, DemonsSoulsHdOutput::UpscaledWidth/Height.)
 	const uint32_t pro_width   = DemonsSoulsHdOutput::UpscaledWidth();
 	const uint32_t pro_height  = DemonsSoulsHdOutput::UpscaledHeight();
-	const uint32_t out_width   = hd ? DemonsSoulsHdOutput::HdWidth : hd_pro ? pro_width : OutputWidth;
-	const uint32_t out_height  = hd ? DemonsSoulsHdOutput::HdHeight : hd_pro ? pro_height : OutputHeight;
+	// (The HD path's: 1920x1080, or the late DLSS output's.)
+	const uint32_t out_width   = hd ? DemonsSoulsHdOutput::OutputWidth() : hd_pro ? pro_width : OutputWidth;
+	const uint32_t out_height  = hd ? DemonsSoulsHdOutput::OutputHeight() : hd_pro ? pro_height : OutputHeight;
 	auto requested = automatic != 0 ? automatic
 	                 : numeric      ? static_cast<uint32_t>(std::strtoul(setting, nullptr, 10))
 	                 : hd_pro       ? pro_height
+	                 : late         ? out_height / 2
 	                                : game_height;
 	if (hd_pro && requested > pro_height) {
 		std::printf("Demon's Souls render size: %u is above the %ux%u output (the upscaler's, KYTY_HD_OUTPUT or "
@@ -194,16 +198,16 @@ void Install(Program* program) {
 		Libs::Graphics::WindowOutputSize(&window_width, &window_height);
 		std::printf("Demon's Souls render size: automatic for the %ux%u window: %s 3D at height %u%s\n", window_width,
 		            window_height, hd ? "HD output (1920x1080)," : trinity ? "PS5 Pro output (3840x2160)," : "4K output,",
-		            std::min(requested, hd ? DemonsSoulsHdOutput::HdHeight : requested),
-		            hd && window_height == DemonsSoulsHdOutput::HdHeight ? " (pixel-exact)"
+		            std::min(requested, hd ? out_height : requested),
+		            hd && window_height == out_height ? " (pixel-exact)"
 		            : !hd && !trinity && window_height == OutputHeight ? " (pixel-exact)"
 		                                                               : "");
-		if (hd && requested > DemonsSoulsHdOutput::HdHeight) requested = DemonsSoulsHdOutput::HdHeight;
+		if (hd && requested > out_height) requested = out_height;
 	}
-	if (hd && requested > DemonsSoulsHdOutput::HdHeight && requested <= OutputHeight) {
-		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%u is above the HD output's 1080; 1080 instead\n",
-		            requested);
-		requested = DemonsSoulsHdOutput::HdHeight;
+	if (hd && requested > out_height && requested <= OutputHeight) {
+		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%u is above the HD output's %u; %u instead\n",
+		            requested, out_height, out_height);
+		requested = out_height;
 	}
 	auto aspect = wide != nullptr && *wide != 0 ? ParseAspect(wide) : 0.0;
 	if (wide != nullptr && *wide != 0 && aspect == 0.0)

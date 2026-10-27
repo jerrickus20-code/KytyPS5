@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string_view>
 
 namespace Loader {
@@ -38,6 +40,8 @@ struct Program;
 namespace DemonsSoulsRenderSize {
 // The automatic height (above), or 0: KYTY_RENDER_HEIGHT set to a number, or no window size known.
 [[nodiscard]] uint32_t AutoHeight(bool upscaler);
+// The one place `bytes` is in the program's loaded segments (a table of the video settings).
+[[nodiscard]] std::optional<uint64_t> FindUniqueData(const Program& program, std::span<const uint8_t> bytes);
 void Install(Program* program);
 // The aspect the 3D is rendered at when KYTY_RENDER_ASPECT took effect (Install), else 0 (the game's 16:9).
 [[nodiscard]] double WideAspect();

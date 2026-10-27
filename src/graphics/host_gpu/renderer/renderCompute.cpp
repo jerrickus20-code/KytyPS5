@@ -980,6 +980,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		FrameGen::OnDispatch(program.shader_hash, bindings.images[1].image_id,
 		                     bindings.images[1].desc.info.data.address, bindings.images[3].image_id,
 		                     bindings.images[3].desc.info.data.address);
+		if (FrameGen::NisAvailable()) {
+			const auto& motion = m_context.GetTextureCache().GetImage(bindings.images[3].image_id);
+			FrameGen::OnLateDispatch(bindings.images[1].image_id, bindings.images[1].desc.info.data.address,
+			                         bindings.images[3].image_id, bindings.images[3].desc.info.data.address,
+			                         {motion.backing.extent.width, motion.backing.extent.height});
+		}
 	}
 	if (FrameCapture::Active()) {
 		auto& call     = FrameCapture::g_call;
@@ -1053,40 +1059,88 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
-	if (indirect_args != 0) {
-		vk::BufferMemoryBarrier args_barrier {};
-		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
-		args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
-		                             vk::AccessFlagBits::eTransferWrite |
-		                             vk::AccessFlagBits::eMemoryWrite;
-		args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
-		args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.buffer              = indirect_buffer;
-		args_barrier.offset              = indirect_offset;
-		args_barrier.size                = 3u * sizeof(uint32_t);
-		if (!continues_chain) {
-			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-			                          vk::PipelineStageFlagBits::eDrawIndirect,
-			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
-			                          nullptr);
+	// KYTY_DLSS: DLSS (DLAA) writes the TAA's output from its color, depth and motion images instead of the TAA.
+	bool replaced_by_dlss = false;
+	bool taa_probe        = false; // KYTY_LIVE_FILE `taaprobe`: the game's TAA, then DLSS, both read back
+	std::array<FrameGen::SrImage, 4> taa_images {};
+	FrameGen::TaaExposure           taa_exposure {};
+	if ((FrameGen::DlssEnabled() || FrameGen::LateAaEnabled()) && indirect_args == 0 &&
+	    FrameGen::IsTaaShader(program.shader_hash) && bindings.images.size() > FrameGen::TaaOutputSlot) {
+		auto&      texture_cache = m_context.GetTextureCache();
+		const auto sr_image      = [&](uint32_t slot) {
+            const auto& binding = bindings.images[slot];
+            auto&       image   = texture_cache.GetImage(binding.image_id);
+            return FrameGen::SrImage {image.backing.image, binding.image_view, image.backing.format,
+                                      {image.backing.extent.width, image.backing.extent.height},
+                                      image.backing.state.layout, image.backing.usage};
+		};
+		taa_images = {sr_image(FrameGen::TaaColorSlot), sr_image(FrameGen::TaaDepthSlot),
+		              sr_image(FrameGen::TaaMotionSlot), sr_image(FrameGen::TaaOutputSlot)};
+		// The TAA's exposure: its one buffer, the float at the start of the guest range (the bound range starts up to
+		// `range - size` bytes before it, for the storage-buffer offset alignment).
+		if (!bindings.buffers.empty() && bindings.buffer_sources.size() == bindings.buffers.size() &&
+		    bindings.buffers[0].buffer && bindings.buffer_sources[0].size >= sizeof(float) &&
+		    bindings.buffers[0].range != VK_WHOLE_SIZE && bindings.buffers[0].range >= bindings.buffer_sources[0].size) {
+			const auto adjustment = bindings.buffers[0].range - bindings.buffer_sources[0].size;
+			if (adjustment % sizeof(float) == 0) {
+				taa_exposure = {bindings.buffers[0].buffer, bindings.buffers[0].offset, bindings.buffers[0].range,
+				                static_cast<uint32_t>(adjustment / sizeof(float))};
+			}
 		}
-		const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash);
-		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
-		DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
-		                    program.shader_hash, 0, 0, 0);
-		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
-	} else {
-		const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash, &bindings,
-		                                          &m_context.GetBufferCache(), input_info.stage.resources.flattened_srt);
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
-		DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
-		                    program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
-		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, thread_group_x,
-		                          thread_group_y, thread_group_z, 0);
+		taa_probe  = FrameGen::TaaProbeWanted(taa_images[0].extent);
+		if (!taa_probe) {
+			// (KYTY_LATE_DLSS_AA: the TAA's color copied through, jittered, for the late DLSS to resolve.)
+			// (Only a color image in one layout as a whole: the copy's barriers name that layout.)
+			replaced_by_dlss = FrameGen::LateAaEnabled()
+			                       ? texture_cache.GetImage(bindings.images[FrameGen::TaaColorSlot].image_id)
+			                                 .backing.subresource_states.empty() &&
+			                             FrameGen::PassThroughTaa(m_context.GetGraphics(), vk_buffer, taa_images[0],
+			                                                      taa_images[3], taa_exposure)
+			                       : FrameGen::EvaluateDlss(m_context.GetGraphics(), vk_buffer, taa_images[0],
+			                                                taa_images[1], taa_images[2], taa_images[3], taa_exposure);
+		}
+	}
+	// (Replaced by DLSS: nothing to dispatch; the barriers below order its writes like the TAA's.)
+	if (!replaced_by_dlss) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
+		if (indirect_args != 0) {
+			vk::BufferMemoryBarrier args_barrier {};
+			args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
+			args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+			                             vk::AccessFlagBits::eTransferWrite |
+			                             vk::AccessFlagBits::eMemoryWrite;
+			args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+			args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			args_barrier.buffer              = indirect_buffer;
+			args_barrier.offset              = indirect_offset;
+			args_barrier.size                = 3u * sizeof(uint32_t);
+			if (!continues_chain) {
+				vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+				                          vk::PipelineStageFlagBits::eDrawIndirect,
+				                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
+				                          nullptr);
+			}
+			const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash);
+			vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+			DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
+			                    program.shader_hash, 0, 0, 0);
+			DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
+		} else {
+			const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash, &bindings,
+			                                          &m_context.GetBufferCache(), input_info.stage.resources.flattened_srt);
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+			DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
+			                    program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
+			DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, thread_group_x,
+			                          thread_group_y, thread_group_z, 0);
+		}
 	}
 
+	if (taa_probe) {
+		FrameGen::TaaProbe(m_context.GetGraphics(), vk_buffer, taa_images[0], taa_images[1], taa_images[2], taa_images[3],
+		                   taa_exposure);
+	}
 	// The removed host fence also ordered read-only dispatches before later writers.
 	if (chain) {
 		buffer.ContinueComputeChain();

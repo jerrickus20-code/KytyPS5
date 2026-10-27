@@ -32,6 +32,10 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {1};
 // KYTY_READBACK_QUEUE (readback-queue.h): 1: readbacks whose bytes no in-flight GPU work writes
 // copy on the transfer queue.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_queue_mode {1};
+// KYTY_READBACK_SPAN: 1: a guest readback window also takes the host buffers next to the
+// request's. 2 (default): 1 while read guards are off (KYTY_READ_GUARD,
+// LibKernel::Memory::ReadGuardsOn), else 0. Not tested with read guards on.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_span_mode {2};
 // 1: pack the LOD report on the GPU instead of a CPU wait and copy.
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {1};
 // 1: shader constants stream through a host-visible upload ring.
@@ -197,6 +201,42 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	auto begin = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
 	auto end = std::min(std::max(begin + WindowSize, address + size),
 	                          buffer.CpuAddress() + buffer.Size());
+	// KYTY_READBACK_SPAN: the window also takes the registered host buffers next to this one, up
+	// to the aligned window. The guest reads a region of 16 KiB buffers one after another: a
+	// fault, a request and a copy each otherwise. Only a wider window that is one mapping with no
+	// GPU-written image is taken; else the window stays this buffer's, as without the switch.
+	const auto owner_at = [&](uint64_t at) -> Buffer* {
+		const auto* owner = m_page_table.Find(at >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) return nullptr;
+		auto& next = m_slot_buffers[*owner];
+		return !next.is_deleted && next.IsInBounds(at, 1) ? &next : nullptr;
+	};
+	bool       spans     = false;
+	const auto span_mode = kyty_local_readback_span_mode.load(std::memory_order_relaxed);
+	if (span_mode == 1 || (span_mode == 2 && !LibKernel::Memory::ReadGuardsOn())) {
+		const auto window_begin = address & ~(WindowSize - 1);
+		const auto window_end   = window_begin + WindowSize;
+		auto       wide_begin   = begin;
+		auto       wide_end     = end;
+		while (wide_begin > window_begin) {
+			const auto* next = owner_at(wide_begin - 1);
+			if (next == nullptr) break;
+			wide_begin = std::max(window_begin, next->CpuAddress());
+		}
+		while (wide_end < window_end) {
+			const auto* next = owner_at(wide_end);
+			if (next == nullptr) break;
+			wide_end = std::min(window_end, next->CpuAddress() + next->Size());
+		}
+		if ((wide_begin != begin || wide_end != end) &&
+		    m_resources->IsMapped(wide_begin, wide_end - wide_begin) &&
+		    LibKernel::Memory::IsUniqueGuestBackingRange(wide_begin, wide_end - wide_begin) &&
+		    !m_texture_cache.HasGpuWrittenImageOverlap(wide_begin, wide_end - wide_begin)) {
+			begin = wide_begin;
+			end   = wide_end;
+			spans = true;
+		}
+	}
 	if (!m_resources->IsMapped(begin, end - begin) ||
 	    !LibKernel::Memory::IsUniqueGuestBackingRange(begin, end - begin)) {
 		// The widening is speculative: a buffer registered over memory the game has since unmapped in part (or maps
@@ -312,7 +352,18 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	pages.reserve(available_pages.Count());
 	available_pages.ForEach([&](uint64_t a, uint64_t end) { pages.push_back({a, end - a}); });
 	m_gpu_modified_ranges.ForEachIntersection(available_pages, [&](RangeSet::Range range) {
-		copies.push_back({&buffer, buffer.Offset(range.address), range.address, range.size});
+		if (!spans) {
+			copies.push_back({&buffer, buffer.Offset(range.address), range.address, range.size});
+			return;
+		}
+		// A copy per host buffer (the window is the buffers found above, all registered).
+		for (uint64_t at = range.address, range_end = range.address + range.size; at < range_end;) {
+			auto* owner = buffer.IsInBounds(at, 1) ? &buffer : owner_at(at);
+			EXIT_IF(owner == nullptr);
+			const auto next = std::min(range_end, owner->CpuAddress() + owner->Size());
+			copies.push_back({owner, owner->Offset(at), at, next - at});
+			at = next;
+		}
 	});
 	if (copies.empty()) {
 		if (completed) *completed = true;
@@ -323,6 +374,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// thousands of small ranges, a copy command each otherwise (seconds of driver calls in one frame).
 	// The parts place each copy's bytes in the download.
 	struct Envelope {
+		Buffer*  buffer;
 		uint64_t source, size, cursor;
 	};
 	constexpr uint64_t                 Gap = 64 * 1024;
@@ -335,13 +387,14 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	uint64_t packed_size = 0;
 	for (const auto& copy: copies) {
 		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-		if (!envelopes.empty() && source_begin <= envelopes.back().source + envelopes.back().size + Gap) {
+		if (!envelopes.empty() && copy.buffer == envelopes.back().buffer &&
+		    source_begin <= envelopes.back().source + envelopes.back().size + Gap) {
 			auto&      last = envelopes.back();
 			const auto end  = std::max(last.source + last.size, source_begin + envelope_size);
 			packed_size += AlignDownload(end - last.source) - AlignDownload(last.size);
 			last.size = end - last.source;
 		} else {
-			envelopes.push_back({source_begin, envelope_size, packed_size});
+			envelopes.push_back({copy.buffer, source_begin, envelope_size, packed_size});
 			packed_size += AlignDownload(envelope_size);
 		}
 		parts.push_back({copy.address, copy.size, envelopes.back().cursor + copy.source_offset - envelopes.back().source});
@@ -351,6 +404,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		}
 	}
 	LiveCounters::Add(LiveCounters::ReadbackRegions, envelopes.size());
+	if (envelopes.front().buffer != envelopes.back().buffer)
+		LiveCounters::Add(LiveCounters::RbSpans);
 	// KYTY_READBACK_SLOTS: when every slot is pending, the render thread waits for the
 	// oldest copy (a GPU tick). Bursts from many guest threads fill the original eight.
 	const size_t slots = kyty_local_readback_slots_mode.load(std::memory_order_relaxed) != 0
@@ -391,7 +446,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		auto&                                                  regions = *regions_scratch;
 		regions.clear();
 		for (const auto& envelope: envelopes)
-			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
+			regions.push_back(
+			    {envelope.buffer->Handle(), {envelope.source, envelope.cursor, envelope.size}});
 		request->parts = std::move(parts);
 		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
 		                                              m_scheduler.GetMasterSemaphore().Handle(),
@@ -407,8 +463,9 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		return request;
 	}
 	for (const auto& envelope: envelopes)
-		download->CopyFrom(m_scheduler.Current(), buffer, envelope.source, envelope.cursor, envelope.size,
-		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		download->CopyFrom(m_scheduler.Current(), *envelope.buffer, envelope.source,
+		                   envelope.cursor, envelope.size, vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead,
 		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 		                   vk::AccessFlagBits::eHostRead);
 	request->parts = std::move(parts);

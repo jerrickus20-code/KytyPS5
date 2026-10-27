@@ -338,7 +338,7 @@ void WalkerThread() {
 	constexpr uint64_t SlowProbeNs  = 2'000'000;
 	constexpr uint64_t PauseWalks = 15, MaxPauseWalks = 60;
 	[[maybe_unused]] uint64_t pause = PauseWalks, resume_walk = 0, slow_passes = 0;
-	uint64_t                  paused = 0, slowest_ns = 0; // (since the last report)
+	uint64_t                  paused = 0, slowest_ns = 0, prepare_ns = 0; // (since the last report)
 	// (address, size) of a free block -> the walk that first found it free, and whether its pages were given back.
 	struct Seen {
 		uint64_t first = 0;
@@ -404,6 +404,15 @@ void WalkerThread() {
 			if (walk < resume_walk || slow || ended || budget == 0 || pass_hold_ns >= LockBudgetNs ||
 			    g_stop.load(std::memory_order_relaxed))
 				break;
+			// Its pages the page manager watches (images' and buffers', read-only in the guest view) made the host's first, as
+			// before a host write: the caches over it invalidated (GPU-written bytes read back), the pages writable. The guest
+			// view's discard then takes them, ~0.07 ms a 256 KiB chunk: the backing view's took ~0.9 ms (and more while a world
+			// streams), and freed textures are most of what a trip leaves free (a 16 GB-policy trip gave back ~170 MiB in
+			// 30 s under the lock budget while 1.3-2.8 GiB stayed free). Without the allocator's lock: this waits for the
+			// caches' locks. (A block the engine takes again meanwhile only has its caches invalidated, as a write would.)
+			const int64_t prepared = NowNs();
+			(void)Libs::LibKernel::Memory::TryPrepareHostWrite(run.address, run.size);
+			prepare_ns += static_cast<uint64_t>(NowNs() - prepared);
 			bool whole = true;
 			for (uint64_t at = 0; at < run.size; at += Chunk) {
 				if (budget == 0 || pass_hold_ns >= LockBudgetNs || !LockAllocator(20)) {
@@ -460,17 +469,18 @@ void WalkerThread() {
 				free_bytes += run.size;
 			std::printf("Engine frees: %llu free blocks, %.0f MiB, on the last walk (%llu+%llu pages, the allocator counts "
 			            "%llu+%llu: %s); %s %.0f MiB in 30 s (%.0f MiB since start), the allocator's lock held %.1f ms (at most "
-			            "%.2f ms); paused %llu time(s) while Windows' memory manager was slow (the slowest step %.2f ms)\n",
+			            "%.2f ms), %.1f ms making blocks the host's; paused %llu time(s) while Windows' memory manager was slow "
+			            "(the slowest step %.2f ms)\n",
 			            static_cast<unsigned long long>(runs.size()), static_cast<double>(free_bytes) / 1048576.0,
 			            static_cast<unsigned long long>(totals.pages[0]), static_cast<unsigned long long>(totals.pages[1]),
 			            static_cast<unsigned long long>(totals.counted_pages[0]),
 			            static_cast<unsigned long long>(totals.counted_pages[1]), counts_match ? "the same" : "DIFFERENT",
 			            give_back ? "given back" : "walked only, would give back", static_cast<double>(given_report) / 1048576.0,
 			            static_cast<double>(given_total) / 1048576.0, static_cast<double>(hold_ns) / 1e6,
-			            static_cast<double>(hold_max_ns) / 1e6, static_cast<unsigned long long>(paused),
-			            static_cast<double>(slowest_ns) / 1e6);
+			            static_cast<double>(hold_max_ns) / 1e6, static_cast<double>(prepare_ns) / 1e6,
+			            static_cast<unsigned long long>(paused), static_cast<double>(slowest_ns) / 1e6);
 			std::fflush(stdout);
-			given_report = hold_ns = hold_max_ns = paused = slowest_ns = 0;
+			given_report = hold_ns = hold_max_ns = paused = slowest_ns = prepare_ns = 0;
 			report_at                                                  = now + 30'000'000'000;
 		}
 	}
